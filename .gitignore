@@ -1,0 +1,20 @@
+# Ignoră folderele generate de PyCharm și Python
+.idea/
+.venv/
+__pycache__/
+
+# Ignoră folderele mari de build/dist de la rădăcină
+build/
+dist/
+
+# Ignoră folderele de build din interiorul aplicației (foarte important!)
+peek_app/build/
+peek_app/dist/
+
+# Ignoră orice fișier Excel sau binar care nu e cod
+*.xlsx
+*.bin
+*.spec
+
+# Ignoră fișierele python din afara folderului peek_app
+/*.py

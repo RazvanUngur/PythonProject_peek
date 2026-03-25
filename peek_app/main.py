@@ -11,7 +11,7 @@ splash = SplashScreen()
 splash.set_status("Se încarcă interfața...", 10)
 
 # ── Importuri grele — pandas, openpyxl, customtkinter ─────────────────────────
-splash.set_status("Se încarcă modulele...", 30)
+splash.set_status("Se încarcă moduleleee...", 30)
 import tkinter as tk
 
 splash.set_status("Se inițializează customtkinter...", 50)

@@ -114,6 +114,12 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
         self._setup_ui()
 
+        # ── Sincronizare contoare.db la pornire ───────────────────────────────
+        # Dacă contoare.db e gol și Excel-ul centralizator are date,
+        # importăm automat în fundal (o singură dată, non-blocking)
+        threading.Thread(target=self._sync_contoare_db_on_start,
+                         daemon=True).start()
+
     def _try_round(self):
         try:
             import ctypes
@@ -122,6 +128,38 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 ctypes.sizeof(ctypes.c_int))
         except Exception:
             pass
+
+    def _sync_contoare_db_on_start(self):
+        """
+        Sincronizare automată la pornire: dacă contoare.db e gol
+        dar Excel-ul centralizator are date, importăm toate contoarele.
+        Rulează în thread daemon — nu blochează GUI.
+        """
+        try:
+            from database import get_contoare_db
+            from contoare_db import _load_contoare_db
+
+            cdb = get_contoare_db()
+            # Verificăm dacă DB-ul e gol
+            toate = cdb.get_all()
+            if toate:
+                return   # DB deja populat, nimic de făcut
+
+            # DB gol → importăm din Excel
+            db_excel = _load_contoare_db()
+            if not db_excel:
+                return   # nici Excel-ul nu are date
+
+            n = 0
+            for ct_id, data in db_excel.items():
+                cdb.upsert(ct_id, data)
+                n += 1
+
+            if n > 0:
+                self.after(0, lambda: self._log(
+                    f"  🗄️  contoare.db sincronizat automat: {n} contoare importate din Excel."))
+        except Exception as _e:
+            print(f"[WARN] Sincronizare contoare.db eșuată: {_e}")
 
     def _setup_ui(self):
         # ── Iconita fereastra (bara de titlu Windows) ─────────────────────────
@@ -193,6 +231,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                   self._choose_files, "primary", width=200)
         self.btn_files.pack(pady=4)
 
+        self.btn_folder_bin = _ctk_btn(card_peek, "📁  Folder recursiv .bin",
+                                       self._choose_folder_bin, "navy", width=200)
+        self.btn_folder_bin.pack(pady=(0, 4))
+
         self.lbl_files = _ctk_label(card_peek, "Niciun fișier .bin selectat.",
                                     font=FONT_SMALL, text_color="#888888")
         self.lbl_files.pack(pady=(2, 8))
@@ -243,6 +285,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                       self._choose_log_files, "primary", width=200)
         self.btn_log_files.pack(pady=4)
 
+        self.btn_folder_log = _ctk_btn(card_vek, "📁  Folder recursiv .log",
+                                       self._choose_folder_log, "navy", width=200)
+        self.btn_folder_log.pack(pady=(0, 4))
+
         self.lbl_log_files = _ctk_label(card_vek, "Niciun fișier .log selectat.",
                                         font=FONT_SMALL, text_color="#888888")
         self.lbl_log_files.pack(pady=(2, 8))
@@ -265,10 +311,20 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                    width=150, state="disabled")
         self.btn_cancel.pack(side="left", padx=8)
 
-        # ── Gestionare Contoare ───────────────────────────────────────────────
-        self.btn_contoare = _ctk_btn(self, "🗄️  Gestionare Contoare",
-                                     self._open_contoare_manager, "navy", width=240)
-        self.btn_contoare.pack(pady=(4, 6))
+        # ── Butoane acțiuni secundare ─────────────────────────────────────────
+        if CTK_AVAILABLE:
+            row_actions = ctk.CTkFrame(self, fg_color="transparent")
+        else:
+            row_actions = tk.Frame(self)
+        row_actions.pack(pady=(4, 6))
+
+        self.btn_contoare = _ctk_btn(row_actions, "🗄️  Gestionare Contoare",
+                                     self._open_contoare_manager, "navy", width=220)
+        self.btn_contoare.pack(side="left", padx=6)
+
+        self.btn_mzl_manual = _ctk_btn(row_actions, "✏️  Procesare manuală MZL",
+                                        self._open_mzl_manual_dialog, "info", width=220)
+        self.btn_mzl_manual.pack(side="left", padx=6)
 
         # ── Progress bar ──────────────────────────────────────────────────────
         if CTK_AVAILABLE:
@@ -339,6 +395,81 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
             self.log_text.config(state="disabled")
+
+    # ── Selectare folder recursiv .bin ────────────────────────────────────────
+    def _choose_folder_bin(self):
+        folder = filedialog.askdirectory(
+            title="Selectează folderul rădăcină — caută recursiv fișiere .bin",
+        )
+        if not folder:
+            return
+        paths = []
+        for root_dir, dirs, files in os.walk(folder):
+            dirs.sort()
+            for fname in sorted(files):
+                if fname.lower().endswith(".bin"):
+                    paths.append(os.path.join(root_dir, fname))
+        if not paths:
+            messagebox.showwarning(
+                "Niciun fișier găsit",
+                f"Nu s-au găsit fișiere .bin în:\n{folder}",
+            )
+            return
+        self.selected_files = paths
+        n = len(paths)
+        def _sid(p):
+            base = os.path.splitext(os.path.basename(p))[0]
+            m = re.findall(r'000+(\d{4})', base)
+            if m: return m[-1]
+            m2 = re.findall(r'(\d{4})', base)
+            return m2[-1] if m2 else "????"
+        ct = sorted(set(_sid(p) for p in paths))
+        nc = len(ct)
+        self.lbl_files.configure(
+            text=f"{n} fișier{'e' if n!=1 else ''} .bin (recursiv) │ {nc} contoar{'e' if nc!=1 else ''}.")
+        sep = "─" * 52
+        self._log(f"\n{sep}")
+        self._log(f"  📁 Folder recursiv .bin: {folder}")
+        self._log(f"  📂 Fișiere: {n}  │  Contoar{'e' if nc!=1 else ''}: {nc}")
+        if nc <= 20: self._log(f"  📋 {', '.join(ct)}")
+        else:        self._log(f"  📋 {', '.join(ct[:20])} ... (+{nc-20})")
+        self._log(sep)
+
+    # ── Selectare folder recursiv .log ────────────────────────────────────────
+    def _choose_folder_log(self):
+        folder = filedialog.askdirectory(
+            title="Selectează folderul rădăcină — caută recursiv fișiere .log",
+        )
+        if not folder:
+            return
+        paths = []
+        for root_dir, dirs, files in os.walk(folder):
+            dirs.sort()
+            for fname in sorted(files):
+                if fname.lower().endswith(".log"):
+                    paths.append(os.path.join(root_dir, fname))
+        if not paths:
+            messagebox.showwarning(
+                "Niciun fișier găsit",
+                f"Nu s-au găsit fișiere .log în:\n{folder}",
+            )
+            return
+        self.selected_log_files = paths
+        n = len(paths)
+        def _sid(p):
+            base = os.path.splitext(os.path.basename(p))[0]
+            return base.split("_")[0]
+        ct = sorted(set(_sid(p) for p in paths))
+        nc = len(ct)
+        self.lbl_log_files.configure(
+            text=f"{n} fișier{'e' if n!=1 else ''} .log (recursiv) │ {nc} contoar{'e' if nc!=1 else ''}.")
+        sep = "─" * 52
+        self._log(f"\n{sep}")
+        self._log(f"  📁 Folder recursiv .log: {folder}")
+        self._log(f"  📂 Fișiere: {n}  │  Contoar{'e' if nc!=1 else ''}: {nc}")
+        if nc <= 20: self._log(f"  📋 {', '.join(ct)}")
+        else:        self._log(f"  📋 {', '.join(ct[:20])} ... (+{nc-20})")
+        self._log(sep)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     def _choose_files(self):
@@ -730,19 +861,35 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 self._update_progress(10, "Se proceseaza datele .bin...")
                 self._log("  🔄 Generare rapoarte Excel (.bin)...")
 
+                # ── Callback progres per contor (apelat din thread-ul bin_parser) ─
+                _bin_proc_start = 10
+                _bin_proc_end   = int(bin_pct_end * 0.65)
+
+                def _bin_progress(site_id, n_ore, idx_ct, total_ct):
+                    if cancelled(): return
+                    pct = int(_bin_proc_start +
+                              (idx_ct / total_ct) * (_bin_proc_end - _bin_proc_start))
+                    self.after(0, lambda p=pct, s=site_id, n=n_ore, i=idx_ct, t=total_ct:
+                        self._update_progress(
+                            p, f"💾 SQLite+Excel [{s}]  {n:,} ore  ({i}/{t})"))
+                    self.after(0, lambda s=site_id, n=n_ore:
+                        self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare"))
+
                 rezultate_bin = process_multiple_files(
-                    self.selected_files, stop_event=self.stop_event) or []
+                    self.selected_files,
+                    stop_event=self.stop_event,
+                    progress_callback=_bin_progress) or []
                 if self.stop_event.is_set(): abort(); return
 
                 if not rezultate_bin:
                     self._log("\n✗ Nicio data valida gasita in fisierele .bin.")
                 else:
                     n_c = len(rezultate_bin)
-                    self._update_progress(int(bin_pct_end * 0.7),
+                    self._update_progress(int(bin_pct_end * 0.65),
                         f"Actualizez centralizatorul ({n_c} contoar{'e' if n_c!=1 else ''} .bin)...")
                     for idx_r, r in enumerate(rezultate_bin):
                         if cancelled(): abort(); return
-                        pct_c = int(bin_pct_end * 0.7 + (idx_r / n_c) * bin_pct_end * 0.28)
+                        pct_c = int(bin_pct_end * 0.65 + (idx_r / n_c) * bin_pct_end * 0.30)
                         self._update_progress(pct_c,
                             f"Centralizator .bin {r['id']} ({idx_r+1}/{n_c})...")
                         try:
@@ -782,10 +929,26 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 self._log("  🔄 Generare rapoarte Excel (.log)...")
 
                 out_dir = os.path.dirname(os.path.abspath(self.selected_log_files[0]))
+
+                # ── Callback progres per contor .log ─────────────────────
+                _log_proc_start = log_pct_start + 5
+                _log_proc_end   = log_pct_start + 18
+
+                def _log_progress(site_id, n_ore, idx_ct, total_ct):
+                    if cancelled(): return
+                    pct = int(_log_proc_start +
+                              (idx_ct / total_ct) * (_log_proc_end - _log_proc_start))
+                    self.after(0, lambda p=pct, s=site_id, n=n_ore, i=idx_ct, t=total_ct:
+                        self._update_progress(
+                            p, f"💾 SQLite+Excel [{s}]  {n:,} ore VEK  ({i}/{t})"))
+                    self.after(0, lambda s=site_id, n=n_ore:
+                        self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare (VEK)"))
+
                 rezultate_log = process_log_files(
                     self.selected_log_files,
                     output_dir=out_dir,
-                    stop_event=self.stop_event) or []
+                    stop_event=self.stop_event,
+                    progress_callback=_log_progress) or []
 
                 if self.stop_event.is_set(): abort(); return
 
@@ -989,6 +1152,12 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     del db[ct_id]
                     _save_contoare_db(db)
                     _delete_contor_from_centralizator(ct_id)
+                    # Ștergere și din contoare.db SQLite
+                    try:
+                        from database import get_contoare_db
+                        get_contoare_db().delete(ct_id)
+                    except Exception as _e:
+                        print(f"[WARN] contoare.db delete eroare [{ct_id}]: {_e}")
                     self._log(f"  🗑  Contoar {ct_id} șters din Gestionare și din Centralizator.")
                     refresh_tree()
 
@@ -1003,6 +1172,463 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
         refresh_tree()
         tree.bind("<Double-1>", lambda e: on_editeaza())
+
+    # ── Procesare manuală MZL ─────────────────────────────────────────────────
+    def _open_mzl_manual_dialog(self):
+        """
+        Fereastră pentru editarea manuală a MZL (Media Zilnică Lunară).
+
+        Flux:
+          1. Operator scrie numărul contorului
+          2. Aplicația interogează DB → afișează localitate + ani/luni disponibile
+          3. Operator selectează an și lună
+          4. Aplicația afișează valoarea curentă calculată + cea manuală existentă
+          5. Operator introduce noua valoare MZL
+          6. Confirmare: "Modifici MZL de la X la Y?" → salvare în DB cu username
+        """
+        try:
+            from database import get_traffic_db, get_contoare_db
+        except ImportError:
+            messagebox.showerror(
+                "Modul lipsă",
+                "Modulul database.py nu este disponibil.\n"
+                "Asigurați-vă că fișierul database.py există în același folder.",
+            )
+            return
+
+        import getpass
+
+        tdb = get_traffic_db()
+        cdb = get_contoare_db()
+
+        # ── Creare fereastră ──────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            win = ctk.CTkToplevel(self)
+        else:
+            win = tk.Toplevel(self)
+
+        win.title("Procesare manuală MZL")
+        win.resizable(False, False)
+        win.grab_set()
+        win.focus_force()
+
+        W, H = 520, 560
+        sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+        win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+
+        _add_logo_header(win, "Procesare manuală MZL", app_ref=self)
+
+        # ── Stare internă ─────────────────────────────────────────────────────
+        var_contor    = tk.StringVar()
+        var_an        = tk.StringVar()
+        var_luna      = tk.StringVar()
+        var_mzl_nou   = tk.StringVar()
+        var_operator  = tk.StringVar(value=getpass.getuser())
+
+        # Valori curente afișate (non-editabile)
+        var_localitate   = tk.StringVar(value="—")
+        var_mzl_calc     = tk.StringVar(value="—")
+        var_mzl_manual   = tk.StringVar(value="—")
+
+        LUNI_NUME = {
+            1: "Ianuarie", 2: "Februarie", 3: "Martie",    4: "Aprilie",
+            5: "Mai",      6: "Iunie",     7: "Iulie",      8: "August",
+            9: "Septembrie", 10: "Octombrie", 11: "Noiembrie", 12: "Decembrie",
+        }
+        LUNI_INV = {v: k for k, v in LUNI_NUME.items()}
+
+        # ── Layout principal ──────────────────────────────────────────────────
+        pad = {"padx": 28, "pady": 5}
+
+        def mk_row(parent, lbl_text, row):
+            """Rând label + widget, returnează frame dreapta."""
+            if CTK_AVAILABLE:
+                ctk.CTkLabel(parent, text=lbl_text, font=FONT_SMALL,
+                             anchor="e", width=130).grid(
+                    row=row, column=0, padx=(0, 10), pady=6, sticky="e")
+            else:
+                tk.Label(parent, text=lbl_text, font=FONT_SMALL,
+                         anchor="e", width=16).grid(
+                    row=row, column=0, padx=(0, 10), pady=6, sticky="e")
+
+        if CTK_AVAILABLE:
+            body = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            body = tk.Frame(win)
+        body.pack(fill="x", padx=20, pady=4)
+        body.columnconfigure(1, weight=1)
+
+        # ── Rând 0: Număr contor ──────────────────────────────────────────────
+        mk_row(body, "Număr contor *", 0)
+        frm_ct = ctk.CTkFrame(body, fg_color="transparent") if CTK_AVAILABLE \
+            else tk.Frame(body)
+        frm_ct.grid(row=0, column=1, sticky="w", pady=6)
+
+        entry_contor = _ctk_entry(frm_ct, textvariable=var_contor, width=120)
+        entry_contor.pack(side="left", padx=(0, 8))
+
+        def on_cauta_contor():
+            ct = var_contor.get().strip()
+            if not ct:
+                return
+            # Localitate din ContoareDB
+            loc = cdb.get_localitate(ct) if ct else ""
+            var_localitate.set(loc if loc else "Necunoscută")
+
+            # Ani disponibili din TrafficDB
+            ani = tdb.get_ani_disponibili(ct)
+            if not ani:
+                messagebox.showwarning("Contor negăsit",
+                    f"Contorul {ct} nu are date în baza de date.", parent=win)
+                var_localitate.set("—")
+                return
+
+            combo_an.configure(values=[str(a) for a in ani])
+            var_an.set(str(ani[-1]))   # selectăm cel mai recent an
+            on_an_changed()            # populăm și lunile
+
+        btn_cauta = _ctk_btn(frm_ct, "🔍 Caută", on_cauta_contor,
+                             "primary", width=90)
+        btn_cauta.pack(side="left")
+
+        # ── Rând 1: Localitate (read-only) ───────────────────────────────────
+        mk_row(body, "Localitate", 1)
+        if CTK_AVAILABLE:
+            ctk.CTkLabel(body, textvariable=var_localitate,
+                         font=("Segoe UI", 11, "bold"),
+                         text_color="#1A5276",
+                         anchor="w").grid(row=1, column=1, sticky="w", pady=4)
+        else:
+            tk.Label(body, textvariable=var_localitate,
+                     font=("Segoe UI", 11, "bold"),
+                     fg="#1A5276", anchor="w").grid(
+                row=1, column=1, sticky="w", pady=4)
+
+        # ── Rând 2: An ────────────────────────────────────────────────────────
+        mk_row(body, "An", 2)
+        combo_an = (ctk.CTkComboBox if CTK_AVAILABLE else ttk.Combobox)(
+            body, variable=var_an,
+            values=[], width=110,
+            state="readonly",
+            **({} if not CTK_AVAILABLE else {"height": 30, "corner_radius": 6})
+        )
+        combo_an.grid(row=2, column=1, sticky="w", pady=6)
+
+        def on_an_changed(*_):
+            ct = var_contor.get().strip()
+            an_str = var_an.get()
+            if not ct or not an_str:
+                return
+            try:
+                an = int(an_str)
+            except ValueError:
+                return
+            luni = tdb.get_luni_disponibile(ct, an)
+            combo_luna.configure(values=[LUNI_NUME[l] for l in luni if l in LUNI_NUME])
+            if luni:
+                var_luna.set(LUNI_NUME[luni[-1]])
+                on_luna_changed()
+
+        combo_an.bind("<<ComboboxSelected>>", on_an_changed)
+        if CTK_AVAILABLE:
+            combo_an.configure(command=on_an_changed)
+
+        # ── Rând 3: Lună ──────────────────────────────────────────────────────
+        mk_row(body, "Lună", 3)
+        combo_luna = (ctk.CTkComboBox if CTK_AVAILABLE else ttk.Combobox)(
+            body, variable=var_luna,
+            values=[], width=160,
+            state="readonly",
+            **({} if not CTK_AVAILABLE else {"height": 30, "corner_radius": 6})
+        )
+        combo_luna.grid(row=3, column=1, sticky="w", pady=6)
+
+        def on_luna_changed(*_):
+            """Afișează MZL calculat și cel manual existent pentru an+lună."""
+            ct     = var_contor.get().strip()
+            an_str = var_an.get()
+            luna_n = var_luna.get()
+            if not ct or not an_str or not luna_n:
+                return
+            try:
+                an   = int(an_str)
+                luna = LUNI_INV.get(luna_n)
+                if luna is None:
+                    return
+            except ValueError:
+                return
+
+            # MZL calculat automat — media ZILNICĂ (suma totală / zile valide)
+            # identic cu logica din excel_report.py (MIN_ORE_ZI ore/zi valide)
+            import sqlite3, calendar
+            try:
+                conn = tdb._conn()
+                # Pas 1: zile valide (≥22 ore înregistrate)
+                rows_zi = conn.execute("""
+                    SELECT zi, SUM(total_general) AS total_zi, COUNT(*) AS ore_zi
+                    FROM inregistrari_orare
+                    WHERE contor=? AND an=? AND luna=?
+                    GROUP BY zi
+                """, (ct, an, luna)).fetchall()
+
+                zile_luna = calendar.monthrange(an, luna)[1]
+                zile_valide = [r for r in rows_zi if int(r["ore_zi"] or 0) >= 22]
+                n_zile_val  = len(zile_valide)
+
+                if n_zile_val > 0:
+                    total_zile_valide = sum(int(r["total_zi"] or 0) for r in zile_valide)
+                    mzl_auto = round(total_zile_valide / n_zile_val)
+                    var_mzl_calc.set(
+                        f"{mzl_auto:,}  "
+                        f"({n_zile_val}/{zile_luna} zile valide)")
+                else:
+                    var_mzl_calc.set("Fără date valide (< 22 ore/zi)")
+            except Exception as e:
+                var_mzl_calc.set(f"Eroare: {e}")
+
+            # MZL manual existent
+            manuale = tdb.get_mzl_manual(ct)
+            val_man = manuale.get((an, luna))
+            if val_man is not None:
+                var_mzl_manual.set(f"{int(val_man):,}")
+                var_mzl_nou.set(str(int(val_man)))
+            else:
+                var_mzl_manual.set("(nesetat)")
+                var_mzl_nou.set("")
+
+        combo_luna.bind("<<ComboboxSelected>>", on_luna_changed)
+        if CTK_AVAILABLE:
+            combo_luna.configure(command=on_luna_changed)
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            ctk.CTkFrame(win, height=1, fg_color="#DDDDDD").pack(
+                fill="x", padx=20, pady=(8, 2))
+        else:
+            ttk.Separator(win, orient="horizontal").pack(
+                fill="x", padx=20, pady=(8, 2))
+
+        # ── Card valori curente ───────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            card_val = ctk.CTkFrame(win, fg_color="#F0F4F8", corner_radius=8)
+        else:
+            card_val = tk.Frame(win, bg="#F0F4F8", relief="flat", bd=1)
+        card_val.pack(fill="x", padx=20, pady=6)
+        card_val.columnconfigure(1, weight=1)
+
+        def info_row(parent, label, var, row, bold=False, color="#1A1A2E"):
+            if CTK_AVAILABLE:
+                ctk.CTkLabel(parent, text=label, font=FONT_SMALL,
+                             anchor="e", width=160,
+                             text_color="#666666").grid(
+                    row=row, column=0, padx=(12, 6), pady=4, sticky="e")
+                ctk.CTkLabel(parent, textvariable=var,
+                             font=("Segoe UI", 11, "bold") if bold else FONT_SMALL,
+                             text_color=color, anchor="w").grid(
+                    row=row, column=1, padx=(0, 12), pady=4, sticky="w")
+            else:
+                tk.Label(parent, text=label, font=FONT_SMALL,
+                         fg="#666666", bg="#F0F4F8",
+                         anchor="e", width=20).grid(
+                    row=row, column=0, padx=(12, 6), pady=4, sticky="e")
+                tk.Label(parent, textvariable=var,
+                         font=("Segoe UI", 10, "bold") if bold else FONT_SMALL,
+                         fg=color, bg="#F0F4F8", anchor="w").grid(
+                    row=row, column=1, padx=(0, 12), pady=4, sticky="w")
+
+        info_row(card_val, "MZL calculat automat:", var_mzl_calc,  0)
+        info_row(card_val, "MZL manual curent:",    var_mzl_manual, 1,
+                 bold=True, color="#1A5276")
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            ctk.CTkFrame(win, height=1, fg_color="#DDDDDD").pack(
+                fill="x", padx=20, pady=(8, 2))
+        else:
+            ttk.Separator(win, orient="horizontal").pack(
+                fill="x", padx=20, pady=(8, 2))
+
+        # ── Câmpuri editabile ─────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            edit_frame = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            edit_frame = tk.Frame(win)
+        edit_frame.pack(fill="x", padx=20, pady=4)
+        edit_frame.columnconfigure(1, weight=1)
+
+        def mk_edit_row(parent, lbl, var, row, placeholder=""):
+            if CTK_AVAILABLE:
+                ctk.CTkLabel(parent, text=lbl, font=FONT_SMALL,
+                             anchor="e", width=130).grid(
+                    row=row, column=0, padx=(0, 10), pady=6, sticky="e")
+                e = ctk.CTkEntry(parent, textvariable=var, width=200,
+                                 height=32, corner_radius=6,
+                                 placeholder_text=placeholder)
+            else:
+                tk.Label(parent, text=lbl, font=FONT_SMALL,
+                         anchor="e", width=16).grid(
+                    row=row, column=0, padx=(0, 10), pady=6, sticky="e")
+                e = ttk.Entry(parent, textvariable=var, width=24)
+            e.grid(row=row, column=1, sticky="w", pady=6)
+            return e
+
+        mk_edit_row(edit_frame, "MZL nou *", var_mzl_nou, 0,
+                    placeholder="ex: 1250")
+
+        # ── Operator — read-only, preluat din Windows (getpass.getuser()) ─────
+        if CTK_AVAILABLE:
+            ctk.CTkLabel(edit_frame, text="Operator", font=FONT_SMALL,
+                         anchor="e", width=130).grid(
+                row=1, column=0, padx=(0, 10), pady=6, sticky="e")
+            ctk.CTkLabel(edit_frame, textvariable=var_operator,
+                         font=("Segoe UI", 11, "bold"),
+                         text_color="#1A5276", anchor="w").grid(
+                row=1, column=1, sticky="w", pady=6)
+        else:
+            tk.Label(edit_frame, text="Operator", font=FONT_SMALL,
+                     anchor="e", width=16).grid(
+                row=1, column=0, padx=(0, 10), pady=6, sticky="e")
+            tk.Label(edit_frame, textvariable=var_operator,
+                     font=("Segoe UI", 10, "bold"),
+                     fg="#1A5276", anchor="w").grid(
+                row=1, column=1, sticky="w", pady=6)
+
+        # ── Notă operator ─────────────────────────────────────────────────────
+        mk_row(edit_frame, "Observații", 2)
+        var_obs = tk.StringVar()
+        if CTK_AVAILABLE:
+            ctk.CTkEntry(edit_frame, textvariable=var_obs, width=280,
+                         height=32, corner_radius=6,
+                         placeholder_text="(opțional)").grid(
+                row=2, column=1, sticky="w", pady=6)
+        else:
+            ttk.Entry(edit_frame, textvariable=var_obs, width=34).grid(
+                row=2, column=1, sticky="w", pady=6)
+
+        # ── Separator + butoane ───────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            ctk.CTkFrame(win, height=1, fg_color="#CCCCCC").pack(
+                fill="x", padx=20, pady=(10, 4))
+        else:
+            ttk.Separator(win, orient="horizontal").pack(
+                fill="x", padx=20, pady=(10, 4))
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent") if CTK_AVAILABLE \
+            else tk.Frame(win)
+        btn_row.pack(pady=10)
+
+        def on_salveaza():
+            ct      = var_contor.get().strip()
+            an_str  = var_an.get().strip()
+            luna_n  = var_luna.get().strip()
+            mzl_str = var_mzl_nou.get().strip()
+            op      = var_operator.get().strip()
+            obs     = var_obs.get().strip()
+
+            # Validări
+            if not ct:
+                messagebox.showwarning("Câmp lipsă",
+                    "Introduceți numărul contorului.", parent=win)
+                return
+            if not an_str or not luna_n:
+                messagebox.showwarning("Selecție lipsă",
+                    "Selectați anul și luna.", parent=win)
+                return
+            if not mzl_str:
+                messagebox.showwarning("Câmp lipsă",
+                    "Introduceți noua valoare MZL.", parent=win)
+                return
+            # Operatorul e preluat automat din Windows — nu poate fi gol
+
+            try:
+                mzl_nou = float(mzl_str.replace(",", ".").replace(" ", ""))
+                if mzl_nou < 0:
+                    raise ValueError("Negativ")
+            except ValueError:
+                messagebox.showerror("Valoare invalidă",
+                    "MZL trebuie să fie un număr pozitiv.", parent=win)
+                return
+
+            try:
+                an   = int(an_str)
+                luna = LUNI_INV[luna_n]
+            except (ValueError, KeyError):
+                messagebox.showerror("Eroare", "An sau lună invalidă.", parent=win)
+                return
+
+            # Valoarea veche (manual sau calculată)
+            manuale_existente = tdb.get_mzl_manual(ct)
+            val_veche_man = manuale_existente.get((an, luna))
+
+            if val_veche_man is not None:
+                val_veche_str = f"{int(val_veche_man):,} (valoare manuală anterioară)"
+            else:
+                # MZL calculat automat — media zilnică (identic cu excel_report.py)
+                try:
+                    import calendar as _cal
+                    rows_zi_s = tdb._conn().execute("""
+                        SELECT zi, SUM(total_general) AS total_zi, COUNT(*) AS ore_zi
+                        FROM inregistrari_orare
+                        WHERE contor=? AND an=? AND luna=?
+                        GROUP BY zi
+                    """, (ct, an, luna)).fetchall()
+                    zile_val_s = [r for r in rows_zi_s if int(r["ore_zi"] or 0) >= 22]
+                    if zile_val_s:
+                        _tot_s = sum(int(r["total_zi"] or 0) for r in zile_val_s)
+                        _mzl_s = round(_tot_s / len(zile_val_s))
+                        val_veche_str = (f"{_mzl_s:,} "
+                                        f"({len(zile_val_s)} zile valide, calculat automat)")
+                    else:
+                        val_veche_str = "fără date valide"
+                except Exception:
+                    val_veche_str = "necunoscută"
+
+            # ── Confirmare cu valoarea veche → nouă ──────────────────────────
+            msg = (
+                f"Contor:   {ct}\n"
+                f"Perioadă: {luna_n} {an}\n"
+                f"Localitate: {var_localitate.get()}\n\n"
+                f"Valoare curentă:  {val_veche_str}\n"
+                f"Valoare nouă:     {int(mzl_nou):,}\n\n"
+                f"Operator: {op}\n\n"
+                f"Confirmi modificarea?"
+            )
+            if not messagebox.askyesno("Confirmare modificare MZL", msg,
+                                        parent=win):
+                return
+
+            # ── Salvare în SQLite ─────────────────────────────────────────────
+            try:
+                tdb.upsert_mzl_manual(
+                    contor=ct, an=an, luna=luna,
+                    valoare=mzl_nou,
+                    observatii=obs,
+                    utilizator=op,
+                )
+                self._log(
+                    f"  ✏️  MZL manual [{ct}] {luna_n} {an}: "
+                    f"{val_veche_str} → {int(mzl_nou):,}  (operator: {op})"
+                )
+                messagebox.showinfo(
+                    "Salvat",
+                    f"MZL pentru contorul {ct} — {luna_n} {an}\n"
+                    f"a fost actualizat la {int(mzl_nou):,}.\n\n"
+                    f"Modificarea va fi aplicată la următoarea generare a raportului.",
+                    parent=win,
+                )
+                # Actualizăm afișarea valorii manuale în fereastră
+                var_mzl_manual.set(f"{int(mzl_nou):,}")
+                var_mzl_nou.set("")
+            except Exception as e:
+                messagebox.showerror("Eroare salvare",
+                    f"Nu s-a putut salva în baza de date:\n{e}", parent=win)
+
+        _ctk_btn(btn_row, "💾  Salvează",  on_salveaza,  "success",   width=150).pack(side="left", padx=8)
+        _ctk_btn(btn_row, "✖  Închide",   win.destroy,  "secondary", width=130).pack(side="left", padx=8)
+
+        # Focus pe câmpul contor la deschidere
+        entry_contor.focus_set()
+        win.bind("<Return>", lambda e: on_cauta_contor())
 
 
 # ==============================================================================

@@ -18,6 +18,7 @@ from config import (
     MIN_ORE_ZI, BAND_COLORS,
 )
 from excel_report import add_charts_and_formatting
+from database import get_traffic_db
 
 def process_peek_bin(filepath):
     """
@@ -790,9 +791,15 @@ def quick_scan_bin(filepath):
 
 
 
-def process_multiple_files(filepaths, output_dir=None, stop_event=None):
-    contoare_data  = {}   # {site_id: [df1, df2, ...]}
-    contoare_lanes = {}   # {site_id: n_lanes}
+def process_multiple_files(filepaths, output_dir=None, stop_event=None,
+                           progress_callback=None):
+    """
+    progress_callback(site_id, n_ore, idx, total_contoare) — apelat după
+    fiecare contor procesat și scris în SQLite + Excel.
+    """
+    contoare_data  = {}
+    contoare_lanes = {}
+    contoare_files = {}
 
     for filepath in filepaths:
         if stop_event and stop_event.is_set():
@@ -804,7 +811,9 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None):
             if site_id not in contoare_data:
                 contoare_data[site_id]  = []
                 contoare_lanes[site_id] = n_lanes
+                contoare_files[site_id] = []
             contoare_data[site_id].append(df)
+            contoare_files[site_id].append(filepath)
             # Păstrăm numărul maxim de benzi găsite pentru acest contor
             if n_lanes > contoare_lanes[site_id]:
                 contoare_lanes[site_id] = n_lanes
@@ -818,11 +827,26 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None):
 
     rezultate_finale = []
     out_dir = os.path.dirname(os.path.abspath(filepaths[0]))
+    _total_ct = len(contoare_data)
 
-    for site_id, lista_dfs in contoare_data.items():
+    for _idx_ct, (site_id, lista_dfs) in enumerate(contoare_data.items(), 1):
         n_lanes = contoare_lanes[site_id]
 
         df_total = pd.concat(lista_dfs, ignore_index=True)
+
+        # ── Calculăm perioada per fișier sursă (înainte de deduplicare) ──────
+        source_fps = contoare_files.get(site_id, [])
+        file_periods = {}
+        for fp, df_f in zip(source_fps, lista_dfs):
+            if not df_f.empty:
+                dt_series = pd.to_datetime(
+                    df_f["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce"
+                ).dropna()
+                if not dt_series.empty:
+                    file_periods[os.path.basename(fp)] = (
+                        dt_series.min().strftime("%d.%m.%Y"),
+                        dt_series.max().strftime("%d.%m.%Y"),
+                    )
 
         # Convertim Data_Ora în datetime real
         df_total["Data_Ora_dt"] = pd.to_datetime(
@@ -868,16 +892,29 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None):
 
         output_fn = os.path.join(out_dir, f"Raport_Clase_Peek_{site_id}.xlsx")
 
-        # Suma totală pe toate benzile
+        # ── 1. Scriere în SQLite (date orare agregate) ─────────────────────
+        try:
+            tdb = get_traffic_db()
+            n_scrise = tdb.upsert_hourly_df(
+                df_total,          # df_total păstrează N_Benzi
+                site_id,
+                tip_sursa="PEEK",
+                source_files=contoare_files.get(site_id, [])
+            )
+            print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare")
+        except Exception as _e_db:
+            print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
+
+        # ── 2. Generare Excel ──────────────────────────────────────────────
         all_band_totals = sum(df_export[c].sum() for c in band_tot_cols
                               if c in df_export.columns)
 
-        # Salvăm Excel-ul brut
         df_export.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
 
-        # Adăugăm graficele DOAR dacă există date
         if all_band_totals > 0:
-            add_charts_and_formatting(output_fn, df_export, site_id)
+            add_charts_and_formatting(output_fn, df_export, site_id,
+                                      source_files=contoare_files.get(site_id, []),
+                                      source_file_periods=file_periods)
         else:
             print(f"Atenție: Contorul {site_id} are trafic zero. Excel generat fără grafice.")
 
@@ -886,8 +923,16 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None):
 
         rezultate_finale.append({
             'path': output_fn, 'id': site_id, 'randuri': len(df_export),
-            'b1': suma_b1, 'b2': suma_b2, 'n_lanes': n_lanes
+            'b1': suma_b1, 'b2': suma_b2, 'n_lanes': n_lanes,
+            'source_files': contoare_files.get(site_id, []),
         })
+
+        # Notifică GUI progresul după fiecare contor complet (SQLite + Excel)
+        if progress_callback:
+            try:
+                progress_callback(site_id, len(df_export), _idx_ct, _total_ct)
+            except Exception:
+                pass
 
     if not rezultate_finale:
         return None

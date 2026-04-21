@@ -21,17 +21,19 @@ from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterPrope
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from config import (
-    VEHICLE_ANALYSIS, MIN_LUNI_AN, MIN_LUNI_AN_MAI, MIN_ORE_ZI, BAND_COLORS,
+    VEHICLE_ANALYSIS, MIN_LUNI_AN, MIN_LUNI_AN_MAI, MIN_LUNI_AN_OCT,
+    MIN_ORE_ZI, BAND_COLORS,
     CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME,
 )
 
-def add_charts_and_formatting(excel_path, df, site_id):
-    MIN_ORE_ZI = 22
+def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source_file_periods=None):
+    MIN_ORE_ZI    = 22
     MIN_ZILE_LUNA = 15
     MIN_ZILE_SAPT = 7
     # importăm globalele — deja definite la nivel de modul
-    _MIN_LUNI_AN = MIN_LUNI_AN
+    _MIN_LUNI_AN     = MIN_LUNI_AN
     _MIN_LUNI_AN_MAI = MIN_LUNI_AN_MAI
+    _MIN_LUNI_AN_OCT = MIN_LUNI_AN_OCT
 
     C_DARK   = "1F4E79"
     C_MID    = "2E75B6"
@@ -40,6 +42,7 @@ def add_charts_and_formatting(excel_path, df, site_id):
     C_GREEN  = "E2EFDA"
     C_ORANGE = "FCE4D6"
     C_YELLOW = "FFF2CC"
+    C_VIOLET = "EAD1DC"   # violet pal — Prelucrare manuală MZL
 
     # Culori benzi
     BAND_COLORS = ["2E75B6", "ED7D31", "70AD47", "FFC000", "5B9BD5", "FF0000"]
@@ -185,7 +188,7 @@ def add_charts_and_formatting(excel_path, df, site_id):
         headers.append(f"Vârf Banda {b}")
     for b in band_ids:
         headers.append(f"Banda {b} %")
-    headers += ["Indicator", "Ore înregistrate"]
+    headers += ["Indicator", "Ore înregistrate", "Verificare"]
 
     n_total_cols = len(headers)
     total_col_idx = 12  # coloana L (1-based) = TOTAL
@@ -195,9 +198,10 @@ def add_charts_and_formatting(excel_path, df, site_id):
     varf_b_start_col = total_b_start_col + n_bands
     # Coloanele Proc_BX: de la col 13+2*n_bands la 12+3*n_bands
     proc_b_start_col = varf_b_start_col + n_bands
-    # Indicator, Ore
-    indicator_col = proc_b_start_col + n_bands
-    ore_col = indicator_col + 1
+    # Indicator, Ore, Verificare
+    indicator_col  = proc_b_start_col + n_bands
+    ore_col        = indicator_col + 1
+    verificare_col = ore_col + 1          # coloana nouă „Verificare"
 
     # Titlu dinamic care acoperă toate coloanele
     title_end_col = get_column_letter(n_total_cols)
@@ -211,7 +215,11 @@ def add_charts_and_formatting(excel_path, df, site_id):
     for c, h in enumerate(headers, 1):
         cell = ws2.cell(2, c, h)
         cell.font = hfont(9)
-        cell.fill = fill(C_MID)
+        # Coloana Verificare — header distinct (violet închis)
+        if h == "Verificare":
+            cell.fill = fill("5B2C6F")
+        else:
+            cell.fill = fill(C_MID)
         cell.alignment = ctr()
         cell.border = brd
     ws2.row_dimensions[2].height = 32
@@ -264,10 +272,26 @@ def add_charts_and_formatting(excel_path, df, site_id):
         vals.append(indicator)
         vals.append(f"{ore_cu_trafic_zi}/24")
 
+        # ── Coloana „Verificare" — status per bandă (C / T / D) ─────────────
+        # C = clasificator, T = totalizator (Clasa_15 > 10%), D = defect (0 veh)
+        PRAG_TOT = 0.10
+        verificare_parts = []
+        for b in band_ids:
+            total_b_zi = int(row.get(f'Total_B{b}', 0))
+            cls15_b_zi = int(row.get(f'B{b}_Clasa_15', 0))
+            if total_b_zi == 0:
+                verificare_parts.append("D")
+            elif cls15_b_zi / total_b_zi > PRAG_TOT:
+                verificare_parts.append("T")
+            else:
+                verificare_parts.append("C")
+        verificare_text = ", ".join(verificare_parts)
+        vals.append(verificare_text)
+
         for c, val in enumerate(vals, 1):
             cell = ws2.cell(dr, c, val)
             cell.border = brd
-            cell.alignment = ctr() if c <= 2 or c >= indicator_col else rgt()
+            cell.alignment = ctr() if (c <= 2 or c >= indicator_col) else rgt()
             if 3 <= c <= total_col_idx + n_bands * 2:
                 cell.number_format = '#,##0'
             if proc_b_start_col <= c <= proc_b_start_col + n_bands - 1:
@@ -278,6 +302,25 @@ def add_charts_and_formatting(excel_path, df, site_id):
             else:
                 cell.font = dfont(9)
                 cell.fill = rf
+
+            # Suprascriere stil celulă Verificare
+            if c == verificare_col:
+                if ore_cu_trafic_zi == 0:
+                    cell.font = dfont(9, bold=True, color="C00000")
+                else:
+                    has_T = "T" in verificare_parts
+                    has_D = "D" in verificare_parts
+                    has_C = "C" in verificare_parts
+                    if has_D:
+                        v_fill = "FADBD8"; v_color = "922B21"   # roz — defect
+                    elif has_T and not has_C:
+                        v_fill = "FCE4D6"; v_color = "C55A11"   # portocaliu — toate TOT
+                    elif has_T:
+                        v_fill = "FFF2CC"; v_color = "7D6608"   # galben — mix T+C
+                    else:
+                        v_fill = "D5F5E3"; v_color = "1E8449"   # verde — toate CLS
+                    cell.font = dfont(9, bold=True, color=v_color)
+                    cell.fill = fill(v_fill)
         dr += 1
 
     last_row = dr - 1
@@ -315,7 +358,7 @@ def add_charts_and_formatting(excel_path, df, site_id):
         elif is_proc:
             cell.number_format = '0.0%'
 
-    widths = [12, 13] + [9] * 9 + [11] + [13] * n_bands + [13] * n_bands + [11] * n_bands + [14, 14]
+    widths = [12, 13] + [9] * 9 + [11] + [13] * n_bands + [13] * n_bands + [11] * n_bands + [14, 14, 22]
     for c, w in enumerate(widths, 1):
         ws2.column_dimensions[get_column_letter(c)].width = w
 
@@ -448,8 +491,330 @@ def add_charts_and_formatting(excel_path, df, site_id):
     chart2.set_categories(cats_all)
     ws2.add_chart(chart2, bar_anchor)
 
-    # ── FOAIE 3: Media Zilnică Lunară ────────────────────────────────────────
+    # ── FOAIE 3: Date prelucrate (după Rezumat Zilnic) ────────────────────────
+    # Perechile bandă ↔ bandă sens opus:
+    #   2 benzi: B1↔B2 | 4 benzi: B1↔B4, B2↔B3 | 6 benzi: B1↔B6, B2↔B5, B3↔B4
+    ws_dp = wb.create_sheet("Date prelucrate")
+    ws_dp.sheet_view.showGridLines = False
+
+    CLASE_IDX = list(range(1, 9)) + [15]
+    PERECHI = {2: {1:2,2:1}, 4: {1:4,2:3,3:2,4:1}, 6: {1:6,2:5,3:4,4:3,5:2,6:1}}
+    perechi = PERECHI.get(n_bands, PERECHI[2])
+    PRAG_TOT_DP = 0.10
+
+    def _sb(tot_b, cls15_b):
+        if tot_b == 0: return 'D'
+        if cls15_b / tot_b > PRAG_TOT_DP: return 'T'
+        return 'C'
+
+    def _recon(donor_cls, donor_tot, target_tot):
+        """
+        Distribuie target_tot pe clase folosind proporțiile din donor.
+        Dacă donor_cls[c] == 0 → rezultat[c] == 0 întotdeauna.
+        Fiecare valoare e ≥ 0; ultimul element absoarbe restul de rotunjire,
+        dar nu poate deveni negativ.
+        """
+        if donor_tot == 0 or target_tot == 0:
+            return {c: 0 for c in CLASE_IDX}
+        res = {}
+        assigned = 0
+        # Sortăm descrescător ca să distribuim primele clasele mari
+        # (minimizează eroarea de rotunjire pe ultimul element)
+        sorted_cls = sorted(CLASE_IDX,
+                            key=lambda c: donor_cls.get(c, 0), reverse=True)
+        for i, c in enumerate(sorted_cls):
+            donor_val = donor_cls.get(c, 0)
+            if donor_val == 0:
+                res[c] = 0   # dacă donorul e 0 → rezultatul e 0, fără excepție
+            elif i == len(sorted_cls) - 1:
+                # Ultimul element: restul, dar minim 0
+                res[c] = max(0, target_tot - assigned)
+            else:
+                v = round(donor_val / donor_tot * target_tot)
+                res[c] = max(0, v)   # niciodată negativ
+                assigned += res[c]
+        return res
+
+    def _copy(src): return {c: max(0, src.get(c, 0)) for c in CLASE_IDX}
+
+    def _scale(src_cls, src_tot, factor):
+        """Scalează clasele src cu factorul factor/src_tot. Valori ≥ 0."""
+        if src_tot == 0 or factor <= 0:
+            return {c: 0 for c in CLASE_IDX}
+        res = {}
+        assigned = 0
+        sorted_cls = sorted(CLASE_IDX,
+                            key=lambda c: src_cls.get(c, 0), reverse=True)
+        for i, c in enumerate(sorted_cls):
+            src_val = src_cls.get(c, 0)
+            if src_val == 0:
+                res[c] = 0
+            elif i == len(sorted_cls) - 1:
+                res[c] = max(0, factor - assigned)
+            else:
+                v = round(src_val / src_tot * factor)
+                res[c] = max(0, v)
+                assigned += res[c]
+        return res
+
+    # Agregare zilnică
+    _df_dp = df.copy()
+    _df_dp['_zi'] = pd.to_datetime(_df_dp['Data_Ora'], format='%d.%m.%Y %H:%M',
+                                    errors='coerce').dt.date
+    _agg_dp = {}
+    for _ci in CLASE_IDX:
+        for _b in band_ids:
+            _col = f'B{_b}_Clasa_{_ci}'
+            if _col in _df_dp.columns: _agg_dp[_col] = 'sum'
+    for _b in band_ids: _agg_dp[f'Total_B{_b}'] = 'sum'
+    _daily_dp = _df_dp.groupby('_zi').agg(_agg_dp).reset_index().sort_values('_zi').reset_index(drop=True)
+
+    SENS1_B = band_ids[:n_bands // 2]
+    SENS2_B = band_ids[n_bands // 2:]
+
+    # Coloane: Data|Zi|S1_cls..|S1_Total|S2_cls..|S2_Total|Total|Status benzi|Tip zi
+    _dp_hdrs = ["Data", "Zi"]
+    for _s, _sb_list in enumerate([SENS1_B, SENS2_B], 1):
+        for _cls in CLASE_IDX: _dp_hdrs.append(f"S{_s}_Cls{_cls}")
+        _dp_hdrs.append(f"S{_s}_Total")
+    _dp_hdrs += ["Total", "Status benzi", "Tip zi"]
+    _n_dp = len(_dp_hdrs)
+    _title_col_dp = get_column_letter(_n_dp)
+
+    # Rând 1 titlu — întreaga lățime
+    ws_dp.merge_cells(f"A1:{_title_col_dp}1")
+    ws_dp["A1"] = (f"DATE PRELUCRATE  |  Contor: {site_id}"
+                   + (f"  |  {localitate_site.lstrip(' -')}" if localitate_site else "")
+                   + "  |  Reconstrucție benzi zilnică")
+    ws_dp["A1"].font      = Font(name='Arial', size=13, bold=True, color=C_WHITE)
+    ws_dp["A1"].fill      = fill(C_DARK)
+    ws_dp["A1"].alignment = ctr()
+    ws_dp.row_dimensions[1].height = 28
+
+    # Rând 2 legendă — întreaga lățime
+    ws_dp.merge_cells(f"A2:{_title_col_dp}2")
+    ws_dp["A2"] = ("🟢 Verde=clasificator(real)   🔵 Albastru=reconstituit din pereche   "
+                   "🟡 Galben=totalizator   🔴 Roșu=neutilizabil")
+    ws_dp["A2"].font      = Font(name='Arial', size=8, italic=True, color="444444")
+    ws_dp["A2"].fill      = fill("F8F8F8")
+    ws_dp["A2"].alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    ws_dp.row_dimensions[2].height = 20
+
+    # Rând 3 header
+    for _ci, _h in enumerate(_dp_hdrs, 1):
+        _cell = ws_dp.cell(3, _ci, _h)
+        _cell.border = brd; _cell.alignment = ctr()
+        if _h in ("Data","Zi","Status benzi","Tip zi"):
+            _cell.font = hfont(9); _cell.fill = fill(C_DARK)
+        elif _h == "Total":
+            _cell.font = hfont(9); _cell.fill = fill("404040")
+        elif _h.startswith("S1_"):
+            _cell.font = hfont(9); _cell.fill = fill("1F4E79")
+        else:
+            _cell.font = hfont(9); _cell.fill = fill("375623")
+    ws_dp.row_dimensions[3].height = 26
+
+    # Lățimi
+    ws_dp.column_dimensions['A'].width = 12
+    ws_dp.column_dimensions['B'].width = 12
+    for _ci in range(3, _n_dp - 2):
+        ws_dp.column_dimensions[get_column_letter(_ci)].width = 9
+    ws_dp.column_dimensions[get_column_letter(_n_dp - 2)].width = 13  # Total
+    ws_dp.column_dimensions[get_column_letter(_n_dp - 1)].width = 20  # Status
+    ws_dp.column_dimensions[get_column_letter(_n_dp)].width = 14      # Tip zi
+
+    F_REAL = "D9EAD3"; F_RECON = "CFE2F3"; F_TOT = "FFF2CC"
+    F_NULL = "F4CCCC"; F_ALT   = "F8F9FA"
+    _days_ro = ['Luni','Marți','Miercuri','Joi','Vineri','Sâmbătă','Duminică']
+
+    # Dict tip_zi per zi — folosit de centralizator pentru Mod funcționare
+    _dp_tip_zi_map = {}
+
+    _dp_row = 4
+    for _, _rz in _daily_dp.iterrows():
+        _zi_date = _rz['_zi']
+        _stat = {}; _rcls = {}; _rtot = {}
+        for _b in band_ids:
+            _tot = int(_rz.get(f'Total_B{_b}', 0))
+            _c15 = int(_rz.get(f'B{_b}_Clasa_15', 0))
+            _stat[_b] = _sb(_tot, _c15)
+            _rtot[_b] = _tot
+            _rcls[_b] = {_c: int(_rz.get(f'B{_b}_Clasa_{_c}', 0)) for _c in CLASE_IDX}
+
+        _status_str = ', '.join(_stat[_b] for _b in band_ids)
+        _ocls = {_b: {} for _b in band_ids}
+        _otot = {_b: 0  for _b in band_ids}
+        _osrc = {_b: 'D' for _b in band_ids}
+        _tip_zi = 'clasificator'; _null_zi = False
+
+        for _b in band_ids:
+            _pb  = perechi[_b]
+            _sb_ = _stat[_b]; _spb = _stat[_pb]
+
+            if _sb_ == 'C':
+                _ocls[_b] = _copy(_rcls[_b]); _otot[_b] = _rtot[_b]; _osrc[_b] = 'C'
+
+            elif _sb_ == 'T':
+                if _spb == 'C' and _rtot[_pb] > 0:
+                    _ocls[_b] = _recon(_rcls[_pb], _rtot[_pb], _rtot[_b])
+                    _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
+                else:
+                    _ocls[_b] = {_c: 0 for _c in CLASE_IDX}
+                    _otot[_b] = _rtot[_b]; _osrc[_b] = 'T'; _tip_zi = 'totalizator'
+
+            else:  # D
+                if _spb == 'C':
+                    # Bandă defectă, pereche clasificatoare → preia valorile perechii
+                    _ss_pb = SENS1_B if _pb in SENS1_B else SENS2_B
+                    _ss_b  = SENS1_B if _b in SENS1_B else SENS2_B
+                    _fip   = [_x for _x in _ss_pb if _x != _pb and _stat[_x] == 'C']
+                    if _fip:
+                        _bfs = [_x for _x in _ss_b if _stat[_x] == 'C']
+                        if _bfs:
+                            _db = _bfs[0]; _rb = perechi[_db]
+                            if _rtot[_rb] > 0:
+                                _sc = (_rtot[_pb] / _rtot[_rb]) * _rtot[_db]
+                                _ocls[_b] = _scale(_rcls[_db], _rtot[_db], round(_sc))
+                                _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
+                            else:
+                                _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+                        else:
+                            _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+                    else:
+                        _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+
+                elif _spb == 'T':
+                    # Pereche totalizatoare → preia totalul perechii
+                    _ocls[_b] = {_c: 0 for _c in CLASE_IDX}
+                    _otot[_b] = _rtot[_pb]; _osrc[_b] = 'T'; _tip_zi = 'totalizator'
+
+                else:  # pb == D, ambele defecte → caută alt sens
+                    _ss_b = SENS1_B if _b in SENS1_B else SENS2_B
+                    _af = [_x for _x in _ss_b if _x != _b and _stat[_x] in ('C','T')]
+                    if _af:
+                        _xb = _af[0]; _xpb = perechi[_xb]
+                        if _stat[_xb] == 'C' and _stat[_xpb] == 'C' and _rtot[_xb] > 0:
+                            _ocls[_b] = _copy(_rcls[_xb]); _otot[_b] = _rtot[_xb]; _osrc[_b] = 'R'
+                        else:
+                            _null_zi = True; _ocls[_b] = {_c:0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+                    else:
+                        _null_zi = True; _ocls[_b] = {_c:0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+
+        if _null_zi: _tip_zi = 'null'
+        _dp_tip_zi_map[_zi_date] = _tip_zi
+
+        # Scriere rând
+        import datetime as _dtm
+        _zi_obj  = _zi_date if hasattr(_zi_date,'weekday') else _dtm.date.fromisoformat(str(_zi_date))
+        _row_bg  = F_NULL if _tip_zi=='null' else F_TOT if _tip_zi=='totalizator' else (F_ALT if _dp_row%2==0 else "FFFFFF")
+
+        for _ci, _val in enumerate([_zi_obj.strftime('%d.%m.%Y'), _days_ro[_zi_obj.weekday()]], 1):
+            _c = ws_dp.cell(_dp_row, _ci, _val)
+            _c.font=dfont(9); _c.fill=fill(_row_bg); _c.border=brd; _c.alignment=ctr()
+
+        _col = 3; _vs1 = 0; _vs2 = 0
+        for _si, _sbn in enumerate([SENS1_B, SENS2_B]):
+            for _cls in CLASE_IDX:
+                _vc = sum(_ocls[_b].get(_cls,0) for _b in _sbn)
+                _srcs = [_osrc[_b] for _b in _sbn]
+                _bg = (F_NULL if _tip_zi=='null' or 'N' in _srcs else
+                       F_TOT  if _tip_zi=='totalizator' else
+                       F_RECON if 'R' in _srcs else F_REAL)
+                _c = ws_dp.cell(_dp_row, _col, _vc if _tip_zi!='null' else "—")
+                _c.font=dfont(9); _c.fill=fill(_bg); _c.border=brd; _c.alignment=rgt()
+                if isinstance(_vc,int) and _tip_zi!='null': _c.number_format='#,##0'
+                _col += 1
+            _vst = sum(_otot[_b] for _b in _sbn)
+            if _si==0: _vs1=_vst
+            else: _vs2=_vst
+            _bg_t = (F_NULL if _tip_zi=='null' else F_TOT if _tip_zi=='totalizator' else
+                     F_RECON if any(_osrc[_b]=='R' for _b in _sbn) else F_REAL)
+            _c = ws_dp.cell(_dp_row, _col, _vst if _tip_zi!='null' else "—")
+            _c.font=dfont(9,bold=True); _c.fill=fill(_bg_t); _c.border=brd; _c.alignment=rgt()
+            if isinstance(_vst,int) and _tip_zi!='null': _c.number_format='#,##0'
+            _col += 1
+
+        # Coloana Total (S1+S2)
+        _vtg = _vs1 + _vs2
+        _c = ws_dp.cell(_dp_row, _col, _vtg if _tip_zi!='null' else "—")
+        _c.font=dfont(9,bold=True); _c.border=brd; _c.alignment=rgt()
+        _c.fill=fill(F_NULL if _tip_zi=='null' else F_TOT if _tip_zi=='totalizator' else "E2EFDA")
+        if isinstance(_vtg,int) and _tip_zi!='null': _c.number_format='#,##0'
+        _col += 1
+
+        # Status benzi
+        _c = ws_dp.cell(_dp_row, _col, _status_str)
+        _c.font=dfont(9); _c.fill=fill(_row_bg); _c.border=brd; _c.alignment=ctr()
+        _col += 1
+
+        # Tip zi
+        _td = {'clasificator':'Clasificator','totalizator':'Totalizator','null':'Neutilizabil'}.get(_tip_zi,_tip_zi)
+        _tc = {'clasificator':"1E8449",'totalizator':"7D6608",'null':"922B21"}.get(_tip_zi,"000000")
+        _c = ws_dp.cell(_dp_row, _col, _td)
+        _c.font=Font(name='Arial',size=9,bold=True,color=_tc)
+        _c.fill=fill(_row_bg); _c.border=brd; _c.alignment=ctr()
+
+        ws_dp.row_dimensions[_dp_row].height = 18
+        _dp_row += 1
+
+    # Rând TOTAL
+    ws_dp.merge_cells(f"A{_dp_row}:B{_dp_row}")
+    _tc2 = ws_dp[f"A{_dp_row}"]
+    _tc2.value="TOTAL PERIOADĂ"; _tc2.font=dfont(bold=True)
+    _tc2.fill=fill(C_GREEN); _tc2.alignment=ctr(); _tc2.border=brd
+    ws_dp[f"B{_dp_row}"].fill=fill(C_GREEN); ws_dp[f"B{_dp_row}"].border=brd
+    for _ci in range(3, _n_dp-1):
+        _cl=get_column_letter(_ci)
+        _c2=ws_dp.cell(_dp_row,_ci,f'=SUMIF({_cl}4:{_cl}{_dp_row-1},"<>—")')
+        _c2.font=dfont(bold=True); _c2.fill=fill(C_GREEN)
+        _c2.border=brd; _c2.alignment=rgt(); _c2.number_format='#,##0'
+    for _ci in [_n_dp-1, _n_dp]:
+        _c3=ws_dp.cell(_dp_row,_ci,""); _c3.fill=fill(C_GREEN); _c3.border=brd
+    ws_dp.freeze_panes = "C4"
+    ws_dp.row_dimensions[_dp_row].height = 22
+
+    # ── FOAIE 4: Media Zilnică Lunară ────────────────────────────────────────
     ws_lunar = wb.create_sheet("Media Zilnica Lunara")
+
+    # ── Citim suprascrierile manuale direct din SQLite (trafic.db) ────────────
+    _manual_overrides = {}   # {(an, luna): valoare_mzl_totala}
+    try:
+        from database import get_traffic_db as _get_tdb
+        _manual_overrides = _get_tdb().get_mzl_manual(str(site_id))
+    except Exception as _e:
+        # Fallback: citim din sheet-ul Excel al centralizatorului (compatibilitate)
+        try:
+            _central_file = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+            if os.path.exists(_central_file):
+                _wb_c = openpyxl.load_workbook(_central_file, data_only=True)
+                if "Prelucrare manuala" in _wb_c.sheetnames:
+                    _ws_pm = _wb_c["Prelucrare manuala"]
+                    _pm_headers = {}
+                    for _ci in range(1, _ws_pm.max_column + 1):
+                        _v = _ws_pm.cell(2, _ci).value
+                        if _v is not None:
+                            _pm_headers[str(_v).strip()] = _ci
+                    _site_str = str(site_id)
+                    for _r in range(3, _ws_pm.max_row + 1):
+                        _ct_col  = _pm_headers.get("Contor")
+                        _an_col  = _pm_headers.get("An")
+                        _lu_col  = _pm_headers.get("Luna")
+                        _mzl_col = _pm_headers.get("MZL_Manual")
+                        if not all([_ct_col, _an_col, _lu_col, _mzl_col]):
+                            break
+                        _ct_val = _ws_pm.cell(_r, _ct_col).value
+                        if _ct_val is None or str(_ct_val).strip() != _site_str:
+                            continue
+                        try:
+                            _an_v  = int(float(str(_ws_pm.cell(_r, _an_col).value)))
+                            _lu_v  = int(float(str(_ws_pm.cell(_r, _lu_col).value)))
+                            _mzl_v = float(str(_ws_pm.cell(_r, _mzl_col).value))
+                            _manual_overrides[(_an_v, _lu_v)] = _mzl_v
+                        except Exception:
+                            continue
+                _wb_c.close()
+        except Exception as _e2:
+            print(f"[WARN] Nu s-au putut citi suprascrierile manuale: {_e2}")
 
     ore_pe_zi2  = df.groupby(['An', 'Luna', 'Zi']).size().reset_index(name='Ore')
     zile_valide = ore_pe_zi2[ore_pe_zi2['Ore'] >= MIN_ORE_ZI][['An', 'Luna', 'Zi']]
@@ -474,8 +839,142 @@ def add_charts_and_formatting(excel_path, df, site_id):
                 return True, week_dates
         return False, []
 
+    # ── Construim tabelul Date prelucrate agregat pe zi (folosit pentru MZL) ──
+    # MZL se calculează din coloana "Total" a sheet-ului Date prelucrate,
+    # adică din valorile reconstruite (benzi D/T corectate) per zi validă.
+    # Zi validă = minim MIN_ORE_ZI ore înregistrate în ziua respectivă.
+
+    # Refolosim _daily_dp și _dp_tip_zi_map construite în blocul Date prelucrate
+    # (variabile locale în scope-ul funcției, calculate anterior)
+
+    def _get_dp_total_zi(zi_date):
+        """Returnează totalul din Date prelucrate pentru o zi dată."""
+        try:
+            _rz = _daily_dp[_daily_dp['_zi'] == zi_date]
+            if _rz.empty:
+                return 0
+            # Recalculăm out_tot exact ca în blocul Date prelucrate
+            _stat_b = {}
+            _rtot_b = {}
+            for _b in band_ids:
+                _t = int(_rz.iloc[0].get(f'Total_B{_b}', 0))
+                _c = int(_rz.iloc[0].get(f'B{_b}_Clasa_15', 0))
+                _stat_b[_b] = 'D' if _t == 0 else ('T' if _c/_t > PRAG_TOT_DP else 'C')
+                _rtot_b[_b] = _t
+            # Total reconstituit = suma out_tot per bandă
+            # Simplificare: folosim _dp_tip_zi_map și recalculăm totalul
+            _tip = _dp_tip_zi_map.get(zi_date, 'null')
+            if _tip == 'null':
+                return 0
+            # Suma tuturor benzilor după reconstrucție
+            # Benzile D preiau valoarea perechii → total = total real
+            total_reconst = 0
+            for _b in band_ids:
+                _pb = perechi.get(_b, _b)
+                if _stat_b[_b] == 'C':
+                    total_reconst += _rtot_b[_b]
+                elif _stat_b[_b] == 'T':
+                    total_reconst += _rtot_b[_b]
+                else:  # D
+                    total_reconst += _rtot_b.get(_pb, 0)
+            return total_reconst
+        except Exception:
+            return 0
+
     lunar_data = []
     for _, row in toate_lunile.iterrows():
+        an, luna = row['An'], row['Luna']
+        df_luna_valida = df_valid[(df_valid['An'] == an) & (df_valid['Luna'] == luna)]
+        nr_zile_valide = df_luna_valida['Zi'].nunique() if len(df_luna_valida) > 0 else 0
+        zile_in_luna   = calendar.monthrange(an, luna)[1]
+
+        if nr_zile_valide == zile_in_luna:
+            indicator, color = "Date complete", "NORMAL"
+            df_calcul = df_luna_valida; divisor = zile_in_luna
+        elif nr_zile_valide >= MIN_ZILE_LUNA:
+            indicator, color = "Date parțiale", "YELLOW"
+            df_calcul = df_luna_valida; divisor = nr_zile_valide
+        else:
+            has_7, week_dates = check_7_consecutive_days(df, an, luna)
+            if has_7:
+                indicator, color = "Date parțiale - 7 zile", "YELLOW"
+                df_calcul = df[df['Zi'].isin(week_dates)]; divisor = 7
+            else:
+                indicator, color = "Nu există date", "ORANGE"
+                df_calcul = pd.DataFrame(); divisor = 0
+
+        if divisor > 0 and not df_calcul.empty:
+            # ── MZL din Date prelucrate — valorile reconstruite per clasă ──────
+            # Colectăm zilele valide din luna curentă care există în _daily_dp
+            zile_valide_luna = df_calcul['Zi'].unique() if 'Zi' in df_calcul.columns else []
+
+            sume_dp = {f'Clasa_{i}': 0 for i in range(1, 9)}
+            sume_dp['Clasa_15'] = 0
+            n_zile_dp = 0
+
+            for _zi_d in zile_valide_luna:
+                # Găsim rândul din _daily_dp
+                _dp_row_zi = _daily_dp[_daily_dp['_zi'] == _zi_d]
+                if _dp_row_zi.empty:
+                    continue
+                _tip = _dp_tip_zi_map.get(_zi_d, 'null')
+                if _tip == 'null':
+                    continue   # zi neutilizabilă → excludem
+
+                # Suma claselor reconstruite (din out_cls per toate benzile)
+                # Reconstrucție rapidă pentru clase
+                _rz   = _dp_row_zi.iloc[0]
+                _stat_b = {}; _rcls_b = {}; _rtot_b = {}
+                for _b in band_ids:
+                    _t = int(_rz.get(f'Total_B{_b}', 0))
+                    _c = int(_rz.get(f'B{_b}_Clasa_15', 0))
+                    _stat_b[_b] = 'D' if _t == 0 else ('T' if _t > 0 and _c/_t > PRAG_TOT_DP else 'C')
+                    _rtot_b[_b] = _t
+                    _rcls_b[_b] = {_ci: int(_rz.get(f'B{_b}_Clasa_{_ci}', 0))
+                                   for _ci in CLASE_IDX}
+
+                for _cls_i in list(range(1, 9)) + [15]:
+                    _col_key = f'Clasa_{_cls_i}'
+                    _val_cls = 0
+                    for _b in band_ids:
+                        _pb = perechi.get(_b, _b)
+                        if _stat_b[_b] == 'C':
+                            _val_cls += max(0, _rcls_b[_b].get(_cls_i, 0))
+                        elif _stat_b[_b] == 'T':
+                            # T: distribuție proporțională din pereche dacă e C
+                            if _stat_b.get(_pb, 'D') == 'C' and _rtot_b.get(_pb, 0) > 0:
+                                _donor_cls_val = _rcls_b[_pb].get(_cls_i, 0)
+                                if _donor_cls_val == 0:
+                                    pass  # donorul 0 → rezultatul 0
+                                else:
+                                    _ratio = _donor_cls_val / _rtot_b[_pb]
+                                    _val_cls += max(0, round(_ratio * _rtot_b[_b]))
+                            # dacă pereche nu e C → 0 clase (totalizator pur)
+                        else:  # D — preia clasele perechii direct
+                            if _stat_b.get(_pb, 'D') == 'C':
+                                _val_cls += max(0, _rcls_b[_pb].get(_cls_i, 0))
+                    sume_dp[_col_key] += max(0, _val_cls)
+                n_zile_dp += 1
+
+            if n_zile_dp > 0:
+                medii = {f'Clasa_{i}': round(sume_dp[f'Clasa_{i}'] / n_zile_dp)
+                         for i in range(1, 9)}
+                medii['Clasa_15'] = round(sume_dp['Clasa_15'] / n_zile_dp)
+                medii['Total']    = sum(medii.values())
+            else:
+                # Fallback la calculul clasic dacă Date prelucrate nu are date
+                sume = {}
+                for i in range(1, 9):
+                    sume[f'Clasa_{i}'] = (df_calcul[f'B1_Clasa_{i}'].sum() +
+                                           df_calcul[f'B2_Clasa_{i}'].sum())
+                sume['Clasa_15'] = (df_calcul['B1_Clasa_15'].sum() +
+                                     df_calcul['B2_Clasa_15'].sum())
+                medii = {f'Clasa_{i}': round(sume[f'Clasa_{i}'] / divisor) for i in range(1, 9)}
+                medii['Clasa_15'] = round(sume['Clasa_15'] / divisor)
+                medii['Total']    = sum(medii.values())
+        else:
+            medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
+            medii['Clasa_15'] = 0; medii['Total'] = 0
         an, luna = row['An'], row['Luna']
         df_luna_valida = df_valid[(df_valid['An'] == an) & (df_valid['Luna'] == luna)]
         nr_zile_valide = df_luna_valida['Zi'].nunique() if len(df_luna_valida) > 0 else 0
@@ -510,24 +1009,60 @@ def add_charts_and_formatting(excel_path, df, site_id):
             medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
             medii['Clasa_15'] = 0; medii['Total'] = 0
 
+        # Mod funcționare lunar = tipul zilei majoritar din Date prelucrate
+        # pentru zilele din luna an/luna
+        _tip_counts = {'clasificator': 0, 'totalizator': 0, 'null': 0}
+        for _zi_d, _tip in _dp_tip_zi_map.items():
+            _zi_an  = _zi_d.year if hasattr(_zi_d, 'year') else int(str(_zi_d)[:4])
+            _zi_lu  = _zi_d.month if hasattr(_zi_d, 'month') else int(str(_zi_d)[5:7])
+            if _zi_an == an and _zi_lu == luna:
+                _tip_counts[_tip] = _tip_counts.get(_tip, 0) + 1
+        if sum(_tip_counts.values()) > 0:
+            mod_functionare_lunar = max(_tip_counts, key=_tip_counts.get)
+        else:
+            mod_functionare_lunar = 'clasificator'
+
         lunar_data.append({
             'Post': site_id, 'An': an, 'Luna': luna,
             **medii, 'Indicator': indicator, 'Color': color,
             'Zile_cu_inregistrari': f"{nr_zile_valide}/{zile_in_luna}",
-            'Are_date_valide': (divisor > 0)  # True dacă luna are date suficiente
+            'Are_date_valide': (divisor > 0),
+            'Mod_functionare': mod_functionare_lunar,
         })
 
-    ws_lunar.merge_cells("A1:O1")
-    ws_lunar["A1"] = (f"MEDIE ZILNICĂ LUNARĂ  |  Contor: {site_id}  |  "
-                      f"Minim {MIN_ORE_ZI}h/zi, minim {MIN_ZILE_LUNA} zile/lună")
+    # ── Aplică suprascrierile manuale ─────────────────────────────────────────
+    for entry in lunar_data:
+        key = (int(entry['An']), int(entry['Luna']))
+        if key in _manual_overrides:
+            mzl_m = round(_manual_overrides[key])
+            # Distribuim egal Total manual pe clase (păstrăm proporțiile dacă există date)
+            old_total = entry.get('Total', 0)
+            if old_total and old_total > 0:
+                ratio = mzl_m / old_total
+                for cls in [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']:
+                    entry[cls] = round(entry.get(cls, 0) * ratio)
+            else:
+                # Nu există date calculate — punem tot în Total, clase 0
+                for cls in [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']:
+                    entry[cls] = 0
+            entry['Total']    = mzl_m
+            entry['Color']    = 'MANUAL'
+            entry['Indicator'] = f"Prelucrare manuală (MZL={mzl_m})"
+
+    # headers_lunar definit ÎNAINTE de merge_cells care îl folosește
+    headers_lunar = ["Post","An","Luna","Clasa 1","Clasa 2","Clasa 3","Clasa 4",
+                     "Clasa 5","Clasa 6","Clasa 7","Clasa 8","Clasa 15",
+                     "Total","Indicator","Mod de funcționare","Zile cu înregistrări"]
+
+    ws_lunar.merge_cells(f"A1:{get_column_letter(len(headers_lunar))}1")
+    ws_lunar["A1"] = (f"MEDIE ZILNICĂ LUNARĂ  |  Contor: {site_id}"
+                      + (f"  |  {localitate_site.lstrip(' -')}" if localitate_site else "")
+                      + f"  |  Minim {MIN_ORE_ZI}h/zi, minim {MIN_ZILE_LUNA} zile/lună")
     ws_lunar["A1"].font = Font(name='Arial', size=13, bold=True, color=C_WHITE)
     ws_lunar["A1"].fill = fill(C_DARK)
     ws_lunar["A1"].alignment = ctr()
     ws_lunar.row_dimensions[1].height = 28
 
-    headers_lunar = ["Post","An","Luna","Clasa 1","Clasa 2","Clasa 3","Clasa 4",
-                     "Clasa 5","Clasa 6","Clasa 7","Clasa 8","Clasa 15",
-                     "Total","Indicator","Zile cu înregistrări"]
     for c, h in enumerate(headers_lunar, 1):
         cell = ws_lunar.cell(2, c, h)
         cell.font = hfont(9); cell.fill = fill(C_MID)
@@ -539,7 +1074,9 @@ def add_charts_and_formatting(excel_path, df, site_id):
 
     dr_lunar = 3
     for i, rd in enumerate(lunar_data):
-        if rd['Color'] == 'YELLOW':
+        if rd['Color'] == 'MANUAL':
+            rf = fill(C_VIOLET)
+        elif rd['Color'] == 'YELLOW':
             rf = fill(C_YELLOW)
         elif rd['Color'] == 'ORANGE':
             rf = fill(C_ORANGE)
@@ -549,23 +1086,151 @@ def add_charts_and_formatting(excel_path, df, site_id):
         vals = [rd['Post'], rd['An'], luna_nume[rd['Luna']],
                 rd['Clasa_1'], rd['Clasa_2'], rd['Clasa_3'], rd['Clasa_4'],
                 rd['Clasa_5'], rd['Clasa_6'], rd['Clasa_7'], rd['Clasa_8'],
-                rd['Clasa_15'], rd['Total'], rd['Indicator'], rd['Zile_cu_inregistrari']]
+                rd['Clasa_15'], rd['Total'], rd['Indicator'],
+                rd.get('Mod_functionare', '').capitalize(),
+                rd['Zile_cu_inregistrari']]
         for c, val in enumerate(vals, 1):
             cell = ws_lunar.cell(dr_lunar, c, val)
             cell.font = dfont(9); cell.fill = rf; cell.border = brd
+            # cols 1-3=text centrat, 4-13=numere dreapta, 14+=text centrat
             cell.alignment = ctr() if c <= 3 or c >= 14 else rgt()
             if 4 <= c <= 13:
                 cell.number_format = '#,##0'
         dr_lunar += 1
 
-    widths_lunar = [10, 8, 8] + [10] * 9 + [12, 14, 16]
+    # ══════════════════════════════════════════════════════════════════════════
+    # MZA — Media Zilnică Anuală (sub tabelul MZL, per an)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Reguli:
+    #   Lună validă = Are_date_valide True (≥ MIN_ZILE_LUNA zile sau 7 consecutive)
+    #   MZA = suma(MZL_luni_valide) / nr_luni_valide, dacă ≥ _MIN_LUNI_AN luni valide
+    #   Fallback 1: dacă < _MIN_LUNI_AN luni valide → valoarea lunii Mai (_MIN_LUNI_AN_MAI)
+    #   Fallback 2: dacă Mai lipsește → valoarea lunii Octombrie (_MIN_LUNI_AN_OCT)
+    #   Fără date: celulă goală
+
+    C_MZA_HDR  = "1F4E79"   # header MZA — albastru închis
+    C_MZA_NORM = "DEEAF1"   # rând MZA calculat normal
+    C_MZA_FALL = "FCE4D6"   # rând MZA fallback (portocaliu pal)
+    C_MZA_NULL = "F4CCCC"   # rând MZA fără date
+
+    lunar_df  = pd.DataFrame(lunar_data)
+    ani_unici = sorted(lunar_df['An'].unique().astype(int).tolist())
+
+    # Spațiu separator
+    dr_sep = dr_lunar + 1
+
+    # Titlu secțiune MZA
+    n_cols_lunar = len(headers_lunar)
+    ws_lunar.merge_cells(f"A{dr_sep}:{get_column_letter(n_cols_lunar)}{dr_sep}")
+    _mza_title = ws_lunar[f"A{dr_sep}"]
+    _mza_title.value     = (f"MEDIA ZILNICĂ ANUALĂ (MZA)  |  "
+                             f"Minim {_MIN_LUNI_AN} luni valide/an  |  "
+                             f"Fallback: Mai → Octombrie")
+    _mza_title.font      = Font(name='Arial', size=11, bold=True, color="FFFFFF")
+    _mza_title.fill      = fill(C_MZA_HDR)
+    _mza_title.alignment = ctr()
+    ws_lunar.row_dimensions[dr_sep].height = 24
+    dr_sep += 1
+
+    # Header MZA — primele 3 coloane diferite față de MZL, ultima coloană = "Luni cu înregistrări"
+    _mza_hdrs = ["Contor", "An", "Tip"] + headers_lunar[3:-1] + ["Luni cu înregistrări"]
+    for c_i, h in enumerate(_mza_hdrs, 1):
+        _hc = ws_lunar.cell(dr_sep, c_i, h)
+        _hc.font      = Font(name='Arial', size=9, bold=True, color="FFFFFF")
+        _hc.fill      = fill(C_MZA_HDR)
+        _hc.alignment = ctr()
+        _hc.border    = brd
+    ws_lunar.row_dimensions[dr_sep].height = 22
+    dr_sep += 1
+
+    # Calculăm MZA per an
+    for an_mza in ani_unici:
+        df_an = lunar_df[lunar_df['An'] == an_mza]
+
+        # Luni valide = Are_date_valide == True
+        df_valide = df_an[df_an['Are_date_valide'] == True]
+        n_luni_val = len(df_valide)
+
+        clase_cols_mza = [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']
+
+        if n_luni_val >= _MIN_LUNI_AN:
+            # Calcul normal: media pe luni valide
+            medii_mza = {}
+            for col in clase_cols_mza:
+                if col in df_valide.columns:
+                    medii_mza[col] = round(df_valide[col].sum() / n_luni_val)
+                else:
+                    medii_mza[col] = 0
+            medii_mza['Total'] = sum(medii_mza.values())
+            indicator_mza = f"MZA normală ({n_luni_val} luni)"
+            color_mza     = C_MZA_NORM
+            mod_mza       = "Clasificator"
+
+        else:
+            # Fallback 1: luna Mai
+            df_mai = df_an[df_an['Luna'] == _MIN_LUNI_AN_MAI]
+            df_mai_valid = df_mai[df_mai['Are_date_valide'] == True]
+
+            if not df_mai_valid.empty:
+                medii_mza = {}
+                for col in clase_cols_mza:
+                    medii_mza[col] = int(df_mai_valid.iloc[0].get(col, 0))
+                medii_mza['Total'] = sum(medii_mza.values())
+                indicator_mza = f"Fallback Mai ({n_luni_val} luni valide)"
+                color_mza     = C_MZA_FALL
+                mod_mza       = df_mai_valid.iloc[0].get('Mod_functionare', 'clasificator').capitalize()
+            else:
+                # Fallback 2: luna Octombrie
+                df_oct = df_an[df_an['Luna'] == _MIN_LUNI_AN_OCT]
+                df_oct_valid = df_oct[df_oct['Are_date_valide'] == True]
+
+                if not df_oct_valid.empty:
+                    medii_mza = {}
+                    for col in clase_cols_mza:
+                        medii_mza[col] = int(df_oct_valid.iloc[0].get(col, 0))
+                    medii_mza['Total'] = sum(medii_mza.values())
+                    indicator_mza = f"Fallback Octombrie ({n_luni_val} luni valide)"
+                    color_mza     = C_MZA_FALL
+                    mod_mza       = df_oct_valid.iloc[0].get('Mod_functionare', 'clasificator').capitalize()
+                else:
+                    # Fără date suficiente
+                    medii_mza     = {col: 0 for col in clase_cols_mza}
+                    medii_mza['Total'] = 0
+                    indicator_mza = f"Insuficient ({n_luni_val} luni valide)"
+                    color_mza     = C_MZA_NULL
+                    mod_mza       = "—"
+
+        rf_mza = fill(color_mza)
+        vals_mza = [
+            site_id, an_mza, "MZA",
+            medii_mza.get('Clasa_1',0), medii_mza.get('Clasa_2',0),
+            medii_mza.get('Clasa_3',0), medii_mza.get('Clasa_4',0),
+            medii_mza.get('Clasa_5',0), medii_mza.get('Clasa_6',0),
+            medii_mza.get('Clasa_7',0), medii_mza.get('Clasa_8',0),
+            medii_mza.get('Clasa_15',0), medii_mza.get('Total',0),
+            indicator_mza, mod_mza, f"{n_luni_val}/12 luni",
+        ]
+        for c_i, val in enumerate(vals_mza, 1):
+            _c = ws_lunar.cell(dr_sep, c_i, val)
+            _c.font      = dfont(9, bold=True)
+            _c.fill      = rf_mza
+            _c.border    = brd
+            _c.alignment = ctr() if c_i <= 3 or c_i >= 14 else rgt()
+            if 4 <= c_i <= 13 and isinstance(val, int):
+                _c.number_format = '#,##0'
+        ws_lunar.row_dimensions[dr_sep].height = 22
+        dr_sep += 1
+
+    # Lățimi coloane — actualizate pentru noile coloane
+    widths_lunar = [10, 8, 8] + [10] * 9 + [12, 20, 18, 16]
     for c, w in enumerate(widths_lunar, 1):
         ws_lunar.column_dimensions[get_column_letter(c)].width = w
 
     # Grafic lunar
     lunar_df  = pd.DataFrame(lunar_data)
     ani_unici = sorted(lunar_df['An'].unique())
-    start_chart_row = dr_lunar + 3
+    # start_chart_row trebuie să fie după tabelul MZA (dr_sep) + 2 rânduri separator
+    start_chart_row = dr_sep + 2
 
     ws_lunar.cell(start_chart_row, 1, "Luna").font = Font(bold=True)
     for idx_an, an in enumerate(ani_unici, 2):
@@ -1075,31 +1740,80 @@ def add_charts_and_formatting(excel_path, df, site_id):
         ws_reguli.cell(2, c, h).alignment = ctr()
         # Înlocuiește întregul bloc `reguli = [...]` și bucla de scriere cu:
         reguli = [
+            # ── Secțiunea 1: Validare date orare / zi ──────────────────────
+            ("─── VALIDARE DATE ───", "", "", ""),
             ("Minim ore / zi", MIN_ORE_ZI, "ore",
-             "Zi validă = minim acest număr de ore înregistrate"),
+             "Zi validă = minim acest număr de ore înregistrate în ziua respectivă. "
+             "Zilele sub acest prag sunt excluse din toate calculele (MZL, MZA)."),
             ("Minim zile / lună", MIN_ZILE_LUNA, "zile",
-             "Medie lunară validă = minim acest număr de zile valide"),
-            ("Alternativă săptămână", MIN_ZILE_SAPT, "zile",
-             "Sau minim 7 zile consecutive valide din lună"),
-            ("Minim luni / an (MZA)", _MIN_LUNI_AN, "luni",
-             f"MZA = medie a lunilor valide dacă sunt cel puțin {_MIN_LUNI_AN} luni cu date"),
-            ("Fallback MZA — luna Mai", _MIN_LUNI_AN_MAI, "luna nr.",
-             f"Dacă sunt sub {_MIN_LUNI_AN} luni valide, MZA preia valoarea lunii Mai (luna {_MIN_LUNI_AN_MAI}); dacă lipsește și Mai → celulă goală"),
+             "Lună validă pentru MZL = minim acest număr de zile valide (≥ MIN_ORE_ZI ore/zi)."),
+            ("Alternativă 7 zile consecutive", MIN_ZILE_SAPT, "zile",
+             f"Dacă luna nu are {MIN_ZILE_LUNA} zile valide, e considerată validă dacă există "
+             f"cel puțin {MIN_ZILE_SAPT} zile consecutive valide. MZL se calculează pe acele 7 zile."),
             ("Date complete", "toate", "zile/lună",
-             "Toate zilele lunii au date valide (ore ≥ MIN_ORE_ZI)"),
+             "Toate zilele lunii au date valide — MZL = suma/zile_în_lună."),
             ("Date parțiale", f"≥{MIN_ZILE_LUNA}", "zile/lună",
-             "Suficiente zile valide dar nu toate — media pe zilele disponibile"),
+             f"Suficiente zile valide ({MIN_ZILE_LUNA}+) dar nu toate — MZL = suma/nr_zile_valide."),
             ("Date parțiale - 7 zile", "1", "săptămână",
-             "Cel puțin o săptămână completă (7 zile consecutive) validă — media pe 7 zile"),
+             f"Fallback: cel puțin {MIN_ZILE_SAPT} zile consecutive valide — MZL = suma/7."),
             ("Nu există date (lună)", "0", "zile/lună",
-             "Nicio zi validă în lună — luna exclusă complet din calcule MZL și MZA"),
+             "Nicio zi validă în lună — luna exclusă complet din MZL și MZA."),
             ("Nu există date (zi)", "0", "ore/zi",
-             "Ziua nu are nicio oră cu vehicule înregistrate — indicator 'Nu există date', rând roșu în Rezumat Zilnic, afișat ca 0/24 la Ore înregistrate"),
+             "Ziua nu are nicio oră cu vehicule — marcată în Rezumat Zilnic cu roșu."),
+            # ── Secțiunea 2: Date prelucrate (reconstrucție benzi) ──────────
+            ("─── DATE PRELUCRATE ───", "", "", ""),
+            ("Prag totalizator (T)", f">{int(PRAG_TOT_DP*100)}%", "din total bandă",
+             f"Bandă = Totalizator dacă Clasa_15 (Others) depășește {int(PRAG_TOT_DP*100)}% "
+             f"din totalul benzii în ziua respectivă. Clasele lipsesc → se reconstituie."),
+            ("Bandă defectă (D)", "0", "vehicule",
+             "Bandă = Defect dacă totalul este 0 vehicule în ziua respectivă."),
+            ("Clasificator (C)", f"≤{int(PRAG_TOT_DP*100)}%", "Clasa_15",
+             "Bandă normală — datele de clase sunt folosite direct, fără reconstituire."),
+            ("Perechi benzi (2 benzi)", "B1↔B2", "sens opus",
+             "Banda 1 și Banda 2 sunt sensuri opuse pe același amplasament. "
+             "Banda D preia valorile perechii C."),
+            ("Perechi benzi (4 benzi)", "B1↔B4, B2↔B3", "sens opus",
+             "Sens 1: B1+B2; Sens 2: B3+B4. Perechile pentru reconstrucție: B1↔B4, B2↔B3."),
+            ("Perechi benzi (6 benzi)", "B1↔B6, B2↔B5, B3↔B4", "sens opus",
+             "Sens 1: B1+B2+B3; Sens 2: B4+B5+B6. Perechile pentru reconstrucție: B1↔B6, B2↔B5, B3↔B4."),
+            ("Reconstituire T din C", "cls_n=(cls_n_pereche/tot_pereche)×tot_T", "clase",
+             "Benzii T i se redistribuie clasele în proporțiile benzii pereche C, "
+             "rotunjit la număr întreg."),
+            ("Reconstituire D din C", "D=pereche", "toate clasele",
+             "Banda D preia direct toate clasele benzii pereche C. "
+             "Dacă ambele benzi sunt D → se caută altă bandă din același sens."),
+            ("Zi neutilizabilă", "ambele D", "sens lipsă",
+             "Dacă nu se poate reconstitui cel puțin un sens → ziua e marcată Neutilizabil "
+             "și exclusă din MZL și MZA."),
+            # ── Secțiunea 3: MZA ────────────────────────────────────────────
+            ("─── MZA ───", "", "", ""),
+            ("Minim luni valide / an", _MIN_LUNI_AN, "luni",
+             f"MZA = medie aritmetică a MZL-urilor lunilor valide, dacă sunt cel puțin "
+             f"{_MIN_LUNI_AN} luni valide din an. MZL = media zilnică a datelor prelucrate."),
+            ("Fallback MZA — luna Mai", f"luna {_MIN_LUNI_AN_MAI}", "Mai",
+             f"Dacă sunt sub {_MIN_LUNI_AN} luni valide, MZA = valoarea MZL a lunii Mai "
+             f"(luna {_MIN_LUNI_AN_MAI}), dacă aceasta este validă."),
+            ("Fallback MZA — luna Octombrie", f"luna {_MIN_LUNI_AN_OCT}", "Octombrie",
+             f"Dacă nici luna Mai nu e validă, MZA = valoarea MZL a lunii Octombrie "
+             f"(luna {_MIN_LUNI_AN_OCT}). Dacă nici Octombrie nu e validă → MZA lipsă."),
         ]
-        for i, (reg, val, unit, desc) in enumerate(reguli, 3):
-            rf = fill(C_LIGHT) if i % 2 == 0 else fill(C_WHITE)
+        # Scriem rândurile de reguli
+        row_reguli = 3
+        for reg, val, unit, desc in reguli:
+            # Rând de secțiune (separator)
+            if str(reg).startswith("───"):
+                ws_reguli.merge_cells(f"A{row_reguli}:D{row_reguli}")
+                _sc = ws_reguli.cell(row_reguli, 1, reg.replace("─── ", "").replace(" ───", ""))
+                _sc.font      = Font(name='Arial', size=9, bold=True, color="FFFFFF")
+                _sc.fill      = fill(C_MID)
+                _sc.alignment = Alignment(horizontal='left', vertical='center')
+                _sc.border    = brd
+                ws_reguli.row_dimensions[row_reguli].height = 20
+                row_reguli += 1
+                continue
+            rf = fill(C_LIGHT) if row_reguli % 2 == 0 else fill(C_WHITE)
             for c, v in enumerate([reg, val, unit, desc], 1):
-                cell = ws_reguli.cell(i, c, v)
+                cell = ws_reguli.cell(row_reguli, c, v)
                 cell.font = dfont(9)
                 cell.fill = rf
                 cell.border = brd
@@ -1107,14 +1821,82 @@ def add_charts_and_formatting(excel_path, df, site_id):
                                   else Alignment(horizontal='left',
                                                  vertical='center',
                                                  wrap_text=True))
-            ws_reguli.row_dimensions[i].height = 30
-        ws_reguli.column_dimensions['A'].width = 28
-        ws_reguli.column_dimensions['B'].width = 14
-        ws_reguli.column_dimensions['C'].width = 12
-        ws_reguli.column_dimensions['D'].width = 65
+            ws_reguli.row_dimensions[row_reguli].height = 30
+            row_reguli += 1
+        ws_reguli.column_dimensions['A'].width = 32
+        ws_reguli.column_dimensions['B'].width = 22
+        ws_reguli.column_dimensions['C'].width = 14
+        ws_reguli.column_dimensions['D'].width = 75
+
+        # ── Secțiunea „Fișiere sursă și perioadă procesată" ──────────────────
+        # Calculăm rândul de start (după tabelul de reguli + 2 rânduri spațiu)
+        start_sursa = len(reguli) + 3 + 2   # header la r=2, reguli incep la r=3
+
+        # Titlu secțiune fișiere sursă
+        ws_reguli.merge_cells(
+            start_row=start_sursa, start_column=1,
+            end_row=start_sursa, end_column=4)
+        tc = ws_reguli.cell(start_sursa, 1,
+                            "FIȘIERE SURSĂ  |  Perioadă procesată")
+        tc.font      = Font(name='Arial', size=11, bold=True, color=C_WHITE)
+        tc.fill      = fill(C_DARK)
+        tc.alignment = ctr()
+        ws_reguli.row_dimensions[start_sursa].height = 24
+
+        # Header tabel fișiere sursă
+        src_headers = ["Nr.", "Fișier sursă", "Cale completă", "Perioadă"]
+        src_col_w   = [6, 42, 80, 28]
+        for c_i, (h, w) in enumerate(zip(src_headers, src_col_w), 1):
+            cell = ws_reguli.cell(start_sursa + 1, c_i, h)
+            cell.font      = hfont(9)
+            cell.fill      = fill(C_MID)
+            cell.alignment = ctr()
+            cell.border    = brd
+
+        # Perioada corectă = perioada din Rezumat Zilnic (fallback global)
+        perioada_globala = f"{first_date} — {last_date}"
+
+        # Completăm rândurile cu fișierele sursă
+        surse = source_files if source_files else []
+        if not surse:
+            surse_display = [("—", "—", perioada_globala)]
+        else:
+            surse_display = []
+            for fp in surse:
+                fname = os.path.basename(fp)
+                fpath = os.path.abspath(fp)
+
+                # ── Calculăm perioada per fișier din df ──────────────────────
+                # source_file_periods este un dict opțional {basename → (min, max)}
+                # transmis din parser; dacă nu există, folosim perioada globală
+                perioad_fisier = perioada_globala
+                if source_file_periods and fname in source_file_periods:
+                    p_min, p_max = source_file_periods[fname]
+                    perioad_fisier = f"{p_min} — {p_max}"
+
+                surse_display.append((fname, fpath, perioad_fisier))
+
+        for row_i, (fname, fpath, perioad) in enumerate(surse_display, 1):
+            r = start_sursa + 1 + row_i
+            rf = fill(C_LIGHT) if row_i % 2 == 1 else fill(C_WHITE)
+            vals = [row_i, fname, fpath, perioad]
+            aligns = [ctr(), Alignment(horizontal='left', vertical='center', wrap_text=False),
+                      Alignment(horizontal='left', vertical='center', wrap_text=False),
+                      ctr()]
+            for c_i, (v, al) in enumerate(zip(vals, aligns), 1):
+                cell = ws_reguli.cell(r, c_i, v)
+                cell.font      = dfont(9)
+                cell.fill      = rf
+                cell.border    = brd
+                cell.alignment = al
+            ws_reguli.row_dimensions[r].height = 18
+
+        # Lărgim coloana C pentru calea completă
+        ws_reguli.column_dimensions['C'].width = 80
 
     wb.active = wb.sheetnames.index("Rezumat Zilnic")
     wb.save(excel_path)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════

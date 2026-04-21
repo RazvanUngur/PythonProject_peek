@@ -304,7 +304,17 @@ def _open_contor_dialog(parent, mode="add", ct_id=None, data=None, on_save=None,
                                     data=existing, on_save=on_save, app_ref=app_ref)
             return
         db[ct_val] = new_data
+
+        # ── Scriere în Excel (centralizator) ──────────────────────────────
         _save_contoare_db(db)
+
+        # ── Scriere în SQLite contoare.db ─────────────────────────────────
+        try:
+            from database import get_contoare_db
+            get_contoare_db().upsert(ct_val, new_data)
+        except Exception as _e:
+            print(f"[WARN] contoare.db write eroare [{ct_val}]: {_e}")
+
         action = "adăugat" if mode == "add" else "actualizat"
         messagebox.showinfo("Salvat", f"Contoarul {ct_val} a fost {action}.", parent=win)
         win.destroy()

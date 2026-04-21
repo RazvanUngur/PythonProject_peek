@@ -79,7 +79,7 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
     wanted = ['Post', 'An', 'Luna',
               'Clasa 1','Clasa 2','Clasa 3','Clasa 4','Clasa 5',
               'Clasa 6','Clasa 7','Clasa 8','Clasa 15',
-              'Total', 'Indicator', 'Zile cu înregistrări']
+              'Total', 'Indicator', 'Mod de funcționare', 'Zile cu înregistrări']
     present_cols = {k: v for k, v in col_map.items() if k in wanted}
 
     rows_out = []
@@ -124,7 +124,8 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
                       if c in df.columns]
     veh_cols       = [g for g in VEHICLE_ANALYSIS.keys() if g in df.columns]
     total_col      = ['Total'] if 'Total' in df.columns else []
-    indicator_cols = [c for c in ['Indicator', 'Zile cu înregistrări'] if c in df.columns]
+    indicator_cols = [c for c in ['Indicator', 'Mod de funcționare',
+                                   'Zile cu înregistrări'] if c in df.columns]
 
     keep = ['Contor', 'An', 'Luna'] + clase_cols + total_col + veh_cols + indicator_cols
     keep = [c for c in keep if c in df.columns]
@@ -142,6 +143,7 @@ def update_centralizator(excel_path, site_id, central_folder):
     C_WHITE  = "FFFFFF"
     C_YELLOW = "FFF2CC"
     C_ORANGE = "FCE4D6"
+    C_VIOLET = "EAD1DC"   # violet pal — Prelucrare manuală MZL
 
     def fill(hex_c):
         return PatternFill('solid', start_color=hex_c)
@@ -164,6 +166,26 @@ def update_centralizator(excel_path, site_id, central_folder):
     # Centralizatorul e mereu la calea fixă, indiferent de unde vin fișierele .bin
     os.makedirs(CENTRAL_FILE_FOLDER, exist_ok=True)
     CENTRAL_FILE = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+
+    # ── 0. Citim ultimul utilizator care a salvat fișierul ────────────────────
+    # openpyxl expune wb.properties.lastModifiedBy — numele din profilul Windows
+    # al ultimului utilizator care a salvat centralizatorul (Excel îl scrie automat).
+    _last_user = ""
+    if os.path.exists(CENTRAL_FILE):
+        try:
+            _wb_meta = openpyxl.load_workbook(CENTRAL_FILE, read_only=True,
+                                               data_only=True)
+            _last_user = (_wb_meta.properties.lastModifiedBy or "").strip()
+            _wb_meta.close()
+        except Exception:
+            _last_user = ""
+    # Fallback: username Windows curent dacă nu avem info din fișier
+    if not _last_user:
+        try:
+            import getpass
+            _last_user = getpass.getuser()
+        except Exception:
+            _last_user = "Necunoscut"
 
     # ── 1. Date noi din raport ────────────────────────────────────────────────
     df_new = _read_lunar_sheet_from_report(excel_path, site_id)
@@ -272,10 +294,12 @@ def update_centralizator(excel_path, site_id, central_folder):
                 break
 
         indicator_col_idx = None
+        mod_func_col_idx  = None
         for cell in ws[2]:
             if cell.value and str(cell.value).strip() == 'Indicator':
                 indicator_col_idx = cell.column
-                break
+            if cell.value and str(cell.value).strip() == 'Mod de funcționare':
+                mod_func_col_idx = cell.column
 
         contoare_unice = list(dict.fromkeys(
             ws.cell(r, contor_col_idx).value
@@ -301,7 +325,9 @@ def update_centralizator(excel_path, site_id, central_folder):
 
             if indicator_col_idx:
                 ind_val = str(ws.cell(r, indicator_col_idx).value or "")
-                if "parțiale" in ind_val:
+                if "manuală" in ind_val or "manuala" in ind_val.lower():
+                    row_fill = fill(C_VIOLET)
+                elif "parțiale" in ind_val:
                     row_fill = fill(C_YELLOW)
                 elif "Nu există" in ind_val:
                     row_fill = fill(C_ORANGE)
@@ -314,6 +340,18 @@ def update_centralizator(excel_path, site_id, central_folder):
                 cell.border    = brd
                 if c in num_cols and isinstance(cell.value, (int, float)):
                     cell.number_format = '#,##0'
+                # Stilizare specială coloana Mod de funcționare
+                if mod_func_col_idx and c == mod_func_col_idx:
+                    _mf = str(cell.value or "").lower()
+                    if "clasificator" in _mf:
+                        cell.font = Font(name='Arial', size=9, bold=True,
+                                         color="1E8449")
+                    elif "totalizator" in _mf:
+                        cell.font = Font(name='Arial', size=9, bold=True,
+                                         color="7D6608")
+                    elif "null" in _mf or "neutiliz" in _mf:
+                        cell.font = Font(name='Arial', size=9, bold=True,
+                                         color="922B21")
 
         for col_cells in ws.iter_cols(min_row=2, max_row=ws.max_row):
             max_len = max(
@@ -368,6 +406,198 @@ def update_centralizator(excel_path, site_id, central_folder):
                 cell.border    = brd
 
         ws_contoare.freeze_panes = "A2"
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET „Prelucrare manuala" — istoric complet din SQLite (read-only)
+        # ════════════════════════════════════════════════════════════════════
+        # Reconstruit complet la fiecare actualizare din tabelul mzl_manual.
+        # Editarea se face exclusiv din GUI (buton „Procesare manuală MZL").
+        # ════════════════════════════════════════════════════════════════════
+
+        if "Prelucrare manuala" in wb.sheetnames:
+            del wb["Prelucrare manuala"]
+
+        ws_pm = wb.create_sheet("Prelucrare manuala")
+        ws_pm.sheet_view.showGridLines = False
+
+        LUNI_NUME_PM = {
+            1: "Ianuarie", 2: "Februarie", 3: "Martie",    4: "Aprilie",
+            5: "Mai",      6: "Iunie",     7: "Iulie",      8: "August",
+            9: "Septembrie", 10: "Octombrie", 11: "Noiembrie", 12: "Decembrie",
+        }
+
+        # ── Citire date din SQLite ────────────────────────────────────────────
+        df_mzl = pd.DataFrame()
+        _db_ok = False
+        try:
+            from database import get_traffic_db
+            _tdb = get_traffic_db()
+            df_mzl = _tdb.get_all_mzl_manual()
+            _db_ok = True
+        except Exception as _e_db:
+            print(f"[WARN] SQLite mzl_manual indisponibil: {_e_db}")
+
+        _now_pm = __import__('datetime').datetime.now().strftime("%d.%m.%Y %H:%M")
+        _n_cols_pm = 8
+
+        # ── Titlu ─────────────────────────────────────────────────────────────
+        ws_pm.merge_cells(f"A1:{get_column_letter(_n_cols_pm)}1")
+        _t = ws_pm["A1"]
+        _t.value     = "PRELUCRARE MANUALĂ MZL  |  Istoric modificări operatori"
+        _t.font      = Font(name='Arial', size=13, bold=True, color=C_WHITE)
+        _t.fill      = fill(C_DARK)
+        _t.alignment = ctr()
+        ws_pm.row_dimensions[1].height = 28
+
+        # ── Subtitlu ──────────────────────────────────────────────────────────
+        ws_pm.merge_cells(f"A2:{get_column_letter(_n_cols_pm)}2")
+        _sub = ws_pm["A2"]
+        if _db_ok:
+            _sub.value = (
+                f"Generat automat din SQLite (trafic.db → mzl_manual)  |  "
+                f"{len(df_mzl)} modificări înregistrate  |  "
+                f"Actualizat: {_now_pm}  |  Utilizator: {_last_user}"
+            )
+        else:
+            _sub.value = (
+                "⚠ SQLite indisponibil — instalați database.py. "
+                "Editare din butonul 'Procesare manuală MZL' din GUI."
+            )
+        _sub.font      = Font(name='Arial', size=9, italic=True, color="595959")
+        _sub.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        _sub.fill      = fill("F2F2F2")
+        ws_pm.row_dimensions[2].height = 22
+
+        # ── Header tabel ──────────────────────────────────────────────────────
+        _pm_hdrs = ["Contor", "An", "Lună",
+                    "Valoare veche (auto)", "Valoare nouă (manual)",
+                    "Observații", "Operator", "Modificat la"]
+        _pm_wds  = [12, 8, 14, 20, 22, 36, 20, 18]
+        for _ci, (_h, _w) in enumerate(zip(_pm_hdrs, _pm_wds), 1):
+            _hc = ws_pm.cell(3, _ci, _h)
+            _hc.font      = hfont(10)
+            _hc.fill      = fill("5B2C6F")   # violet închis — distincție vizuală
+            _hc.alignment = ctr()
+            _hc.border    = brd
+            ws_pm.column_dimensions[get_column_letter(_ci)].width = _w
+        ws_pm.row_dimensions[3].height = 26
+
+        # ── Rânduri date ──────────────────────────────────────────────────────
+        _r_pm = 4
+        if _db_ok and not df_mzl.empty:
+            # Calculăm valoarea veche (MZL auto) pentru fiecare intrare
+            import calendar as _cal
+            try:
+                _conn_r = _tdb._conn()
+                _auto_dict = {}
+                for _, _rm in df_mzl.iterrows():
+                    # MZL auto = media ZILNICĂ (suma totală / zile valide ≥ MIN_ORE_ZI)
+                    # identic cu logica din excel_report.py
+                    _rows_zi = _conn_r.execute("""
+                        SELECT zi,
+                               SUM(total_general) AS total_zi,
+                               COUNT(*) AS ore_zi
+                        FROM inregistrari_orare
+                        WHERE contor=? AND an=? AND luna=?
+                        GROUP BY zi
+                    """, (str(_rm["contor"]), int(_rm["an"]),
+                          int(_rm["luna"]))).fetchall()
+                    _zile_val = [r for r in _rows_zi if int(r["ore_zi"] or 0) >= 22]
+                    _key = (str(_rm["contor"]), int(_rm["an"]), int(_rm["luna"]))
+                    if _zile_val:
+                        _tot_val = sum(int(r["total_zi"] or 0) for r in _zile_val)
+                        _mzl_calc = round(_tot_val / len(_zile_val))
+                        _auto_dict[_key] = {
+                            "mzl_auto": _mzl_calc,
+                            "zile": len(_zile_val)
+                        }
+                    else:
+                        _auto_dict[_key] = None
+            except Exception:
+                _auto_dict = {}
+
+            _df_sort = df_mzl.sort_values(
+                ["contor", "an", "luna"],
+                ascending=[True, False, False]
+            ).reset_index(drop=True)
+
+            for _idx, _rm in _df_sort.iterrows():
+                _ct   = str(_rm["contor"])
+                _an   = int(_rm["an"])
+                _lu   = int(_rm["luna"])
+                _mnew = _rm["mzl_valoare"]
+                _obs  = str(_rm.get("observatii", "") or "")
+                _op   = str(_rm.get("utilizator", "") or "")
+                _mla  = str(_rm.get("modificat_la", "") or "")
+
+                # Format data
+                try:
+                    from datetime import datetime as _dtt
+                    _mla_fmt = _dtt.fromisoformat(_mla).strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    _mla_fmt = _mla
+
+                # Valoare veche
+                _av = _auto_dict.get((_ct, _an, _lu))
+                if _av and _av["mzl_auto"] is not None:
+                    _zile_luna = _cal.monthrange(_an, _lu)[1]
+                    _val_v = int(_av["mzl_auto"])
+                    _val_v_str = f"{_val_v:,}  ({int(_av['zile'])}/{_zile_luna} zile)"
+                else:
+                    _val_v_str = "Fără date"
+
+                _luna_str = LUNI_NUME_PM.get(_lu, str(_lu))
+                _rf_pm = fill(C_VIOLET) if _idx % 2 == 0 else fill("F5EDF8")
+
+                _vals_pm = [
+                    _ct, _an, _luna_str,
+                    _val_v_str,
+                    int(_mnew) if _mnew is not None else "",
+                    _obs, _op, _mla_fmt,
+                ]
+                _aligns_pm = [
+                    ctr(), ctr(), ctr(),
+                    Alignment(horizontal='right',  vertical='center'),
+                    Alignment(horizontal='right',  vertical='center'),
+                    Alignment(horizontal='left',   vertical='center', wrap_text=True),
+                    Alignment(horizontal='center', vertical='center'),
+                    Alignment(horizontal='center', vertical='center'),
+                ]
+                for _ci2, (_v, _al) in enumerate(zip(_vals_pm, _aligns_pm), 1):
+                    _cell = ws_pm.cell(_r_pm, _ci2, _v)
+                    _cell.font      = dfont(9, bold=(_ci2 in (1, 5)))
+                    _cell.fill      = _rf_pm
+                    _cell.border    = brd
+                    _cell.alignment = _al
+                    if _ci2 == 5 and isinstance(_v, (int, float)):
+                        _cell.number_format = "#,##0"
+                    if _ci2 == 5:
+                        _cell.font = Font(name='Arial', size=10, bold=True,
+                                          color="4A235A")
+                ws_pm.row_dimensions[_r_pm].height = 20
+                _r_pm += 1
+        else:
+            ws_pm.merge_cells(f"A4:{get_column_letter(_n_cols_pm)}4")
+            _ec = ws_pm["A4"]
+            _ec.value = (
+                "Nu există modificări manuale înregistrate." if _db_ok
+                else "SQLite indisponibil — verificați că database.py este instalat."
+            )
+            _ec.font      = Font(name='Arial', size=9, italic=True, color="888888")
+            _ec.alignment = Alignment(horizontal='center', vertical='center')
+            _ec.fill      = fill("FAFAFA")
+            ws_pm.row_dimensions[4].height = 28
+            _r_pm = 5
+
+        # ── Notă subsol ───────────────────────────────────────────────────────
+        ws_pm.merge_cells(f"A{_r_pm}:{get_column_letter(_n_cols_pm)}{_r_pm}")
+        _nota = ws_pm.cell(_r_pm, 1,
+            "ℹ Sheet generat automat. Nu editați direct — "
+            "folosiți butonul „Procesare manuală MZL” din aplicație.")
+        _nota.font      = Font(name='Arial', size=8, italic=True, color="AAAAAA")
+        _nota.alignment = Alignment(horizontal='left', vertical='center')
+
+        ws_pm.freeze_panes = "A4"
 
         # ════════════════════════════════════════════════════════════════════
         # SHEET "Analiza" — dropdown legat dinamic de sheet-ul "Contoare"

@@ -11,6 +11,7 @@ import pandas as pd
 
 from config import LOG_CLASS_MAP, BAND_COLORS, MIN_ORE_ZI
 from excel_report import add_charts_and_formatting
+from database import get_traffic_db
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROCESARE FIȘIERE .LOG (VEK/ADR format)
@@ -26,9 +27,9 @@ from excel_report import add_charts_and_formatting
 #   6=Lorry with trailer, 7=Truck, 8=Bus, 15=Other
 #
 # Output:
-#   • <Contor>_treceri_brute.csv  – toate înregistrările individuale
-#   • Raport_Clase_Log_<Contor>.xlsx – Date Detaliate + toate analizele Peek
-#   • Centralizator actualizat
+#   - <Contor>_treceri_brute.csv  - toate înregistrările individuale
+#   - Raport_Clase_Log_<Contor>.xlsx - Date Detaliate + toate analizele Peek
+#   - Centralizator actualizat
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,10 +52,10 @@ from excel_report import add_charts_and_formatting
 #   Lorry_with_trailer=6, Truck=7, Bus=8, Other=15
 #
 # Output:
-#   • <Contor>_treceri_brute.csv  – toate inregistrarile individuale
-#   • Raport_Clase_Log_<Contor>.xlsx – Date Detaliate (coloane cu nume) +
+#   - <Contor>_treceri_brute.csv  - toate inregistrarile individuale
+#   - Raport_Clase_Log_<Contor>.xlsx - Date Detaliate (coloane cu nume) +
 #     Media Zilnica Lunara + Media Zilnica Anuala
-#   • Centralizator actualizat
+#   - Centralizator actualizat
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Mapare clasa text VEK → index Clasa_1..15 (identic cu .bin)
@@ -179,16 +180,12 @@ def _build_log_hourly_df(df_raw, site_id):
     return pd.DataFrame(rows)
 
 
-def process_log_files(filepaths, output_dir=None, stop_event=None):
+def process_log_files(filepaths, output_dir=None, stop_event=None,
+                      progress_callback=None):
     """
-    Proceseaza o lista de fisiere .log VEK/ADR.
-
-    Output per contor:
-      • <site_id>_treceri_brute.csv  – toate inregistrarile individuale
-      • Raport_Clase_Log_<site_id>.xlsx – format identic Peek (Date Detaliate +
-        Rezumat Zilnic + Media Zilnica Lunara + Profil Orar Mediu +
-        Comparatie Benzi + Reguli Calcul), via add_charts_and_formatting
-      • Centralizator actualizat
+    Proceseaza fisiere .log VEK/ADR.
+    progress_callback(site_id, n_ore, idx, total_contoare) - apelat dupa
+    fiecare contor procesat si scris in SQLite + Excel.
     """
     if not filepaths:
         return None
@@ -204,9 +201,10 @@ def process_log_files(filepaths, output_dir=None, stop_event=None):
         sid  = base.split("_")[0]
         contoare_files.setdefault(sid, []).append(fp)
 
-    rezultate = []
+    rezultate   = []
+    _total_ct   = len(contoare_files)
 
-    for site_id, files in contoare_files.items():
+    for _idx_ct, (site_id, files) in enumerate(contoare_files.items(), 1):
         if stop_event and stop_event.is_set():
             return None
 
@@ -224,6 +222,16 @@ def process_log_files(filepaths, output_dir=None, stop_event=None):
 
         df_all = pd.concat(frames, ignore_index=True)
         df_all = df_all.sort_values("Datetime").reset_index(drop=True)
+
+        # ── Calculăm perioada per fișier sursă ───────────────────────────────
+        file_periods = {}
+        for fp in files:
+            fname = os.path.basename(fp)
+            df_f = df_all[df_all["SourceFile"] == fname]
+            if not df_f.empty:
+                p_min = df_f["Datetime"].min().strftime("%d.%m.%Y")
+                p_max = df_f["Datetime"].max().strftime("%d.%m.%Y")
+                file_periods[fname] = (p_min, p_max)
 
         # ── 2. CSV brut ───────────────────────────────────────────────────────
         csv_path = os.path.join(output_dir, f"{site_id}_treceri_brute.csv")
@@ -262,26 +270,37 @@ def process_log_files(filepaths, output_dir=None, stop_event=None):
                          if f"Total_B{b}" in df_hourly.columns]
         df_hourly["Total_General"] = df_hourly[band_tot_cols].sum(axis=1)
 
-        # ── 4. Excel cu toate sheeturile Peek ─────────────────────────────────
+        # ── 3. Scriere în SQLite (date orare agregate) ────────────────────────
+        try:
+            tdb = get_traffic_db()
+            n_scrise = tdb.upsert_hourly_df(
+                df_hourly, site_id,
+                tip_sursa="VEK",
+                source_files=files
+            )
+            print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare (VEK)")
+        except Exception as _e_db:
+            print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
+
+        # ── 4. Excel cu toate sheeturile ──────────────────────────────────────
         output_fn = os.path.join(output_dir, f"Raport_Clase_VEK_{site_id}.xlsx")
 
         df_export = df_hourly.drop(columns=["N_Benzi"], errors="ignore")
         df_export = df_export.reset_index(drop=True)
 
-        # Salvam Date Detaliate
         df_export.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
 
-        # Adaugam toate analizele Peek (Rezumat Zilnic, MZL, Profil Orar, etc.)
         all_band_totals = sum(df_export[c].sum() for c in band_tot_cols
                               if c in df_export.columns)
 
-        # add_charts_and_formatting are nevoie de Timestamp si N_Benzi
         df_for_charts = df_hourly.copy()
         df_for_charts["Timestamp"] = pd.to_datetime(
             df_for_charts["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce")
 
         if all_band_totals > 0:
-            add_charts_and_formatting(output_fn, df_for_charts, site_id)
+            add_charts_and_formatting(output_fn, df_for_charts, site_id,
+                                      source_files=files,
+                                      source_file_periods=file_periods)
         else:
             print(f"Atentie: Contorul LOG {site_id} are trafic zero.")
 
@@ -295,7 +314,15 @@ def process_log_files(filepaths, output_dir=None, stop_event=None):
             "b1":      int(suma_b1),
             "b2":      int(suma_b2),
             "n_lanes": n_lanes,
+            "source_files": files,
         })
+
+        # Notifică GUI progresul după fiecare contor complet
+        if progress_callback:
+            try:
+                progress_callback(site_id, len(df_export), _idx_ct, _total_ct)
+            except Exception:
+                pass
 
     return rezultate if rezultate else None
 

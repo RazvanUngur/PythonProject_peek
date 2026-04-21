@@ -15,9 +15,12 @@ VEHICLE_ANALYSIS = {
 }
 
 # ── Constante calcul ──────────────────────────────────────────────────────────
-MIN_LUNI_AN     = 10  # luni valide minime pentru MZA completă
-MIN_LUNI_AN_MAI =  5  # luna Mai (nr. 5) — fallback când lipsesc ≥10 luni
-MIN_ORE_ZI      = 22  # ore minime pentru zi validă
+MIN_LUNI_AN      = 10  # luni valide minime pentru MZA completă
+MIN_LUNI_AN_MAI  =  5  # luna Mai (nr. 5)  — fallback primar când < 10 luni valide
+MIN_LUNI_AN_OCT  = 10  # luna Octombrie (nr. 10) — fallback secundar dacă Mai lipsește
+MIN_ORE_ZI       = 22  # ore minime pentru zi validă
+MIN_ZILE_LUNA    = 15  # zile valide minime pentru lună validă în MZA
+MIN_ZILE_SAPT    =  7  # zile consecutive minime (alternativă la MIN_ZILE_LUNA)
 
 # ── Culori grafice pentru benzi ───────────────────────────────────────────────
 BAND_COLORS = ["2E75B6", "ED7D31", "A9D18E", "FF0000", "7030A0", "00B0F0"]

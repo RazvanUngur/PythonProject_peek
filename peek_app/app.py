@@ -5,7 +5,9 @@
 import os
 import re
 import sys
+import time
 import threading
+from datetime import datetime
 import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import filedialog, messagebox
@@ -311,6 +313,11 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                    width=150, state="disabled")
         self.btn_cancel.pack(side="left", padx=8)
 
+        self.btn_force_unlock = _ctk_btn(row_btns, "🔓  Eliberează lock",
+                                         self._force_release_lock, "warning",
+                                         width=170, state="normal")
+        self.btn_force_unlock.pack(side="left", padx=8)
+
         # ── Butoane acțiuni secundare ─────────────────────────────────────────
         if CTK_AVAILABLE:
             row_actions = ctk.CTkFrame(self, fg_color="transparent")
@@ -325,6 +332,17 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         self.btn_mzl_manual = _ctk_btn(row_actions, "✏️  Procesare manuală MZL",
                                         self._open_mzl_manual_dialog, "info", width=220)
         self.btn_mzl_manual.pack(side="left", padx=6)
+
+        # ── Al doilea rând de acțiuni ─────────────────────────────────────────
+        if CTK_AVAILABLE:
+            row_actions2 = ctk.CTkFrame(self, fg_color="transparent")
+        else:
+            row_actions2 = tk.Frame(self)
+        row_actions2.pack(pady=(0, 4))
+
+        self.btn_sorteaza = _ctk_btn(row_actions2, "📦  Sortează .bin după post",
+                                     self._sorteaza_bin_dialog, "warning", width=230)
+        self.btn_sorteaza.pack(side="left", padx=6)
 
         # ── Progress bar ──────────────────────────────────────────────────────
         if CTK_AVAILABLE:
@@ -374,6 +392,256 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         _ctk_label(p, "PEEK Traffic Analyzer",
                    font=("Segoe UI", 20, "bold"),
                    text_color="#C0392B").pack(pady=(20, 6))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Sortare .bin după post
+    # ══════════════════════════════════════════════════════════════════════════
+    def _sorteaza_bin_dialog(self):
+        """Deschide fereastra de configurare și progres pentru sortarea .bin."""
+        win = ctk.CTkToplevel(self) if CTK_AVAILABLE else tk.Toplevel(self)
+        win.title("Sortare fișiere .bin după post")
+        win.resizable(True, True)
+        win.grab_set()
+
+        W, H = 680, 520
+        sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+        win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+
+        # ── Cai configurabile ─────────────────────────────────────────────────
+        DEFAULT_SURSA = r"L:\BIDMRCT\datePEEK\Descarcari"
+        DEFAULT_DEST  = r"L:\BIDMRCT\datePEEK"
+
+        var_sursa = tk.StringVar(value=DEFAULT_SURSA)
+        var_dest  = tk.StringVar(value=DEFAULT_DEST)
+
+        if CTK_AVAILABLE:
+            hdr = ctk.CTkFrame(win, fg_color="#1A5276", corner_radius=0)
+        else:
+            hdr = tk.Frame(win, bg="#1A5276")
+        hdr.pack(fill="x")
+        _ctk_label(hdr, "  📦  Sortare fișiere .bin după post",
+                   font=("Segoe UI", 13, "bold"),
+                   text_color="#FFFFFF").pack(anchor="w", padx=12, pady=10)
+
+        # ── Formular cai ──────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            form = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            form = tk.Frame(win)
+        form.pack(fill="x", padx=16, pady=10)
+
+        def _row_cale(parent, label, var, row):
+            if CTK_AVAILABLE:
+                ctk.CTkLabel(parent, text=label, font=FONT_SMALL,
+                             anchor="e", width=120).grid(
+                    row=row, column=0, padx=(0, 8), pady=6, sticky="e")
+                e = ctk.CTkEntry(parent, textvariable=var, width=380,
+                                 height=32, corner_radius=6)
+                e.grid(row=row, column=1, sticky="ew", pady=6)
+                btn = ctk.CTkButton(parent, text="📁", width=36, height=32,
+                                    corner_radius=6,
+                                    command=lambda v=var: _browse(v))
+                btn.grid(row=row, column=2, padx=(6, 0), pady=6)
+            else:
+                tk.Label(parent, text=label, font=FONT_SMALL,
+                         anchor="e", width=16).grid(
+                    row=row, column=0, padx=(0, 8), pady=6, sticky="e")
+                e = ttk.Entry(parent, textvariable=var, width=48)
+                e.grid(row=row, column=1, sticky="ew", pady=6)
+                tk.Button(parent, text="📁",
+                          command=lambda v=var: _browse(v)).grid(
+                    row=row, column=2, padx=(6, 0), pady=6)
+            parent.columnconfigure(1, weight=1)
+
+        def _browse(var):
+            folder = filedialog.askdirectory(parent=win)
+            if folder:
+                var.set(folder)
+
+        _row_cale(form, "Folder sursă:", var_sursa, 0)
+        _row_cale(form, "Folder posturi:", var_dest,  1)
+
+        _ctk_label(form,
+                   "  ℹ️  Fișierele .bin din sursă vor fi mutate în subfolderele\n"
+                   "      de forma  XXXX_Localitate  din folderul posturi.",
+                   font=FONT_SMALL, text_color="#555555").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        # ── Log fereastră ─────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            log_frame = ctk.CTkFrame(win, fg_color="#F8F9FA", corner_radius=8)
+        else:
+            log_frame = tk.Frame(win, relief="sunken", bd=1)
+        log_frame.pack(fill="both", expand=True, padx=16, pady=(4, 8))
+
+        if CTK_AVAILABLE:
+            log_box = ctk.CTkTextbox(log_frame, font=FONT_MONO,
+                                     corner_radius=6, wrap="word",
+                                     state="disabled")
+            log_box.pack(fill="both", expand=True, padx=6, pady=6)
+        else:
+            txt_fr = tk.Frame(log_frame)
+            txt_fr.pack(fill="both", expand=True, padx=6, pady=6)
+            log_box = tk.Text(txt_fr, font=FONT_MONO, state="disabled",
+                              relief="flat", wrap="word",
+                              bg="#F8F9FA", fg="#212529")
+            sb2 = ttk.Scrollbar(txt_fr, orient="vertical",
+                                 command=log_box.yview)
+            log_box.configure(yscrollcommand=sb2.set)
+            sb2.pack(side="right", fill="y")
+            log_box.pack(fill="both", expand=True)
+
+        def _log_win(msg):
+            if CTK_AVAILABLE:
+                log_box.configure(state="normal")
+                log_box.insert("end", msg + "\n")
+                log_box.see("end")
+                log_box.configure(state="disabled")
+            else:
+                log_box.config(state="normal")
+                log_box.insert("end", msg + "\n")
+                log_box.see("end")
+                log_box.config(state="disabled")
+
+        # ── Butoane ───────────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            btn_row = tk.Frame(win)
+        btn_row.pack(pady=(0, 12))
+
+        btn_start = _ctk_btn(btn_row, "▶  Pornește sortarea",
+                             lambda: _start(), "success", width=200)
+        btn_start.pack(side="left", padx=8)
+
+        _ctk_btn(btn_row, "✖  Închide", win.destroy,
+                 "secondary", width=130).pack(side="left", padx=8)
+
+        # ── Logica de sortare (rulează în thread) ─────────────────────────────
+        def _start():
+            sursa = var_sursa.get().strip()
+            dest  = var_dest.get().strip()
+
+            if not os.path.isdir(sursa):
+                messagebox.showerror("Eroare",
+                    f"Folderul sursă nu există:\n{sursa}", parent=win)
+                return
+            if not os.path.isdir(dest):
+                messagebox.showerror("Eroare",
+                    f"Folderul posturi nu există:\n{dest}", parent=win)
+                return
+
+            btn_start.configure(state="disabled")
+            # Șterge log-ul anterior
+            if CTK_AVAILABLE:
+                log_box.configure(state="normal")
+                log_box.delete("0.0", "end")
+                log_box.configure(state="disabled")
+            else:
+                log_box.config(state="normal")
+                log_box.delete("1.0", "end")
+                log_box.config(state="disabled")
+
+            threading.Thread(
+                target=_run_sortare,
+                args=(sursa, dest),
+                daemon=True
+            ).start()
+
+        def _run_sortare(sursa, dest):
+            import shutil
+
+            def _extrage_site_id(filepath):
+                try:
+                    with open(filepath, "rb") as f:
+                        raw = f.read(150)
+                    header_text = "".join(
+                        [chr(b) if 32 <= b <= 126 else " " for b in raw])
+                    matches = re.findall(r'000+(\d{4})', header_text)
+                    if matches:
+                        return matches[-1]
+                    base_name = os.path.basename(filepath)
+                    m = re.search(r'(\d{4})', base_name)
+                    return m.group(1) if m else None
+                except Exception as e:
+                    return None
+
+            # Construim map cod -> folder destinatie
+            folder_map = {}
+            for entry in os.scandir(dest):
+                if entry.is_dir():
+                    m = re.match(r'^(\d{4})_', entry.name)
+                    if m:
+                        folder_map[m.group(1)] = entry.path
+
+            win.after(0, lambda: _log_win(
+                f"{'─'*55}\n"
+                f"  Sursă:    {sursa}\n"
+                f"  Posturi:  {dest}\n"
+                f"  Foldere posturi găsite: {len(folder_map)}\n"
+                f"{'─'*55}"))
+
+            fisiere = [f for f in os.listdir(sursa) if f.lower().endswith(".bin")]
+            if not fisiere:
+                win.after(0, lambda: _log_win("  ⚠️  Nu există fișiere .bin în folderul sursă."))
+                win.after(0, lambda: btn_start.configure(state="normal"))
+                return
+
+            win.after(0, lambda: _log_win(f"  Fișiere .bin găsite: {len(fisiere)}\n"))
+
+            mutate = 0; negasite = 0; existente = 0; erori = 0
+
+            for fisier in sorted(fisiere):
+                cale_sursa = os.path.join(sursa, fisier)
+                site_id = _extrage_site_id(cale_sursa)
+
+                if site_id is None:
+                    msg = f"  ⚠️  {fisier}  →  cod neidentificat, omis"
+                    win.after(0, lambda m=msg: _log_win(m))
+                    negasite += 1
+                    continue
+
+                if site_id not in folder_map:
+                    msg = f"  ❓  {fisier}  →  cod {site_id} fără folder corespondent"
+                    win.after(0, lambda m=msg: _log_win(m))
+                    negasite += 1
+                    continue
+
+                folder_dest = folder_map[site_id]
+                cale_dest   = os.path.join(folder_dest, fisier)
+
+                if os.path.exists(cale_dest):
+                    msg = f"  ⏭️  {fisier}  →  deja există în {os.path.basename(folder_dest)}"
+                    win.after(0, lambda m=msg: _log_win(m))
+                    existente += 1
+                    continue
+
+                try:
+                    shutil.move(cale_sursa, cale_dest)
+                    msg = f"  ✅  {fisier}  →  {os.path.basename(folder_dest)}"
+                    win.after(0, lambda m=msg: _log_win(m))
+                    # Log si in jurnalul principal
+                    self.after(0, lambda m=msg: self._log(m))
+                    mutate += 1
+                except Exception as e:
+                    msg = f"  ❌  {fisier}  →  eroare: {e}"
+                    win.after(0, lambda m=msg: _log_win(m))
+                    erori += 1
+
+            sumar = (
+                f"\n{'─'*55}\n"
+                f"  ✅  Mutate cu succes:   {mutate}\n"
+                f"  ⏭️  Deja existente:     {existente}\n"
+                f"  ❓  Fără folder:        {negasite}\n"
+                f"  ❌  Erori:              {erori}\n"
+                f"{'─'*55}"
+            )
+            win.after(0, lambda: _log_win(sumar))
+            self.after(0, lambda: self._log(
+                f"  📦  Sortare .bin finalizată — "
+                f"mutate: {mutate}, existente: {existente}, "
+                f"fără folder: {negasite}, erori: {erori}"))
+            win.after(0, lambda: btn_start.configure(state="normal"))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _update_progress(self, percent, text):
@@ -500,12 +768,103 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         self._log(sep)
 
     # ── Procesare unificata (.bin + .log) ─────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Lock file — procesare exclusivă pe rețea (bin + MZL manual)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Timeout de siguranță: 30 minute. Dacă aplicația cade în mijlocul
+    # unei operații, lock-ul e ignorat automat după 30 minute.
+    # Lock-ul normal se eliberează imediat în blocul finally al fiecărei operații.
+    _LOCK_TIMEOUT = 1800  # 30 minute
+
+    def _get_lock_path(self):
+        """Calea fișierului .procesare.lock pe drive-ul comun."""
+        try:
+            return os.path.join(CENTRAL_FILE_FOLDER, ".procesare.lock")
+        except Exception:
+            return None
+
+    def _acquire_lock(self, tip_operatie: str = "Operație"):
+        """
+        Încearcă să obțină lock-ul.
+        tip_operatie: text afișat celorlalți utilizatori (ex: 'Procesare .bin (5 fișiere)')
+        Returnează True dacă a reușit, 'OCUPAT:info' dacă e blocat.
+        """
+        import getpass, socket
+        lock_path = self._get_lock_path()
+        if lock_path is None:
+            return True
+        try:
+            if os.path.exists(lock_path):
+                age = time.time() - os.path.getmtime(lock_path)
+                if age > self._LOCK_TIMEOUT:
+                    # Lock vechi — expirat, îl ștergem și continuăm
+                    try:
+                        os.remove(lock_path)
+                        self._log("⚠  Lock vechi detectat și eliberat automat (timeout 30 min).")
+                    except Exception:
+                        return True
+                else:
+                    try:
+                        info = open(lock_path, encoding="utf-8").read().strip()
+                    except Exception:
+                        info = "alt utilizator (detalii indisponibile)"
+                    return f"OCUPAT:{info}"
+            # Scriem lock-ul nostru
+            user = getpass.getuser()
+            host = socket.gethostname()
+            ts   = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            info = f"{user}@{host} | {ts} | {tip_operatie}"
+            with open(lock_path, "w", encoding="utf-8") as f:
+                f.write(info)
+            return True
+        except Exception:
+            return True  # dacă nu putem gestiona lock-ul, continuăm oricum
+
+    def _release_lock(self):
+        """Eliberează lock-ul. Apelat în finally — rulează întotdeauna."""
+        lock_path = self._get_lock_path()
+        if not lock_path:
+            return
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
+
+    def _check_lock_and_warn(self, tip_operatie: str = "Operație") -> bool:
+        """
+        Verifică lock-ul și afișează mesaj dacă e ocupat.
+        Returnează True dacă putem continua, False dacă e blocat.
+        """
+        result = self._acquire_lock(tip_operatie)
+        if isinstance(result, str) and result.startswith("OCUPAT:"):
+            info = result[7:]
+            messagebox.showwarning(
+                "Operație în curs",
+                f"Un alt utilizator efectuează o operație în acest moment:\n\n"
+                f"  {info}\n\n"
+                f"Așteptați finalizarea și încercați din nou.\n"
+                f"Dacă operația s-a terminat și mesajul persistă,\n"
+                f"apăsați butonul  🔓 Eliberează lock.",
+                parent=self,
+            )
+            return False
+        return True
+
     def _run_all_processing(self):
         has_bin = bool(self.selected_files)
         has_log = bool(self.selected_log_files)
         if not has_bin and not has_log:
             messagebox.showwarning("Atentie", "Selecteaza cel putin un fisier .bin sau .log!")
             return
+
+        # ── Verificare lock rețea ─────────────────────────────────────────────
+        n_bin = len(self.selected_files)
+        n_log = len(self.selected_log_files)
+        tip   = f"Procesare fișiere ({n_bin} .bin" + (f", {n_log} .log" if n_log else "") + ")"
+        if not self._check_lock_and_warn(tip):
+            return
+
         self.stop_event.clear()
         self.btn_process.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -621,6 +980,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             traceback.print_exc()
             self._update_progress(0, "✗  Eroare la procesare.")
         finally:
+            self._release_lock()
             self.btn_process.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
             self.selected_files = []
@@ -800,6 +1160,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._log(f"\n✗ Eroare neasteptata: {ex}")
             self._update_progress(0, "✗  Eroare procesare.")
         finally:
+            self._release_lock()  # eliberăm lock-ul indiferent de rezultat
             self.after(0, lambda: self.btn_process.configure(state="normal"))
             self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
             self.after(0, lambda: setattr(self, "selected_files", []))
@@ -1011,6 +1372,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._log(f"\n✗ Eroare neasteptata: {ex}")
             self._update_progress(0, "✗  Eroare procesare.")
         finally:
+            self._release_lock()
             self.after(0, lambda: self.btn_process.configure(state="normal"))
             self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
             self.after(0, lambda: setattr(self, "selected_files", []))
@@ -1022,6 +1384,29 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         self.stop_event.set()
         self.lbl_status.configure(text="Se anulează procesarea…")
         self._log("⚠ Anulare solicitată de utilizator.")
+
+    def _force_release_lock(self):
+        """Eliberează manual lock-ul de procesare — pentru situații de urgență."""
+        lock_path = self._get_lock_path()
+        if not lock_path or not os.path.exists(lock_path):
+            messagebox.showinfo("Lock", "Nu există niciun lock activ de procesare.",
+                                parent=self)
+            return
+        try:
+            info = open(lock_path, encoding="utf-8").read().strip()
+        except Exception:
+            info = "necunoscut"
+        if messagebox.askyesno(
+            "Eliberează lock",
+            f"Există un lock activ de la:\n\n  {info}\n\n"
+            f"Ești sigur că vrei să îl eliberezi forțat?\n"
+            f"(Folosește doar dacă procesarea s-a terminat sau aplicația a căzut)",
+            parent=self
+        ):
+            self._release_lock()
+            self._log("🔓  Lock de procesare eliberat manual.")
+            messagebox.showinfo("Gata", "Lock-ul a fost eliberat. Poți procesa acum.",
+                                parent=self)
 
     # ── Selectare și procesare fișiere .log ───────────────────────────────────
     def _choose_log_files(self):
@@ -1201,16 +1586,53 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         tdb = get_traffic_db()
         cdb = get_contoare_db()
 
-        # ── Creare fereastră ──────────────────────────────────────────────────
+        # ── Creare fereastră — singleton: dacă există deja, o aducem în față ──
+        if hasattr(self, '_mzl_win') and self._mzl_win is not None:
+            try:
+                if self._mzl_win.winfo_exists():
+                    self._mzl_win.lift()
+                    self._mzl_win.focus_force()
+                    return
+            except Exception:
+                pass
+            self._mzl_win = None
+
         if CTK_AVAILABLE:
             win = ctk.CTkToplevel(self)
         else:
             win = tk.Toplevel(self)
 
+        self._mzl_win = win
+
+        def _on_close():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            self._mzl_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
         win.title("Procesare manuală MZL")
         win.resizable(False, False)
-        win.grab_set()
-        win.focus_force()
+        # Aducem fereastra în față — lift + focus după randare completă
+        def _bring_to_front():
+            if not win.winfo_exists():
+                return
+            win.lift()
+            win.attributes("-topmost", True)
+            win.after(200, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+            win.focus_force()
+            # grab_local în loc de grab_set — nu blochează alte instanțe ale
+            # aplicației pe alte PC-uri care accesează aceeași bază de date
+            try:
+                win.grab_set_global() if False else win.grab_set()
+            except Exception:
+                pass
+        win.after(150, _bring_to_front)
 
         W, H = 520, 560
         sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
@@ -1271,21 +1693,36 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             ct = var_contor.get().strip()
             if not ct:
                 return
-            # Localitate din ContoareDB
-            loc = cdb.get_localitate(ct) if ct else ""
-            var_localitate.set(loc if loc else "Necunoscută")
+            btn_cauta.configure(state="disabled")
+            var_localitate.set("Se caută...")
 
-            # Ani disponibili din TrafficDB
-            ani = tdb.get_ani_disponibili(ct)
-            if not ani:
-                messagebox.showwarning("Contor negăsit",
-                    f"Contorul {ct} nu are date în baza de date.", parent=win)
-                var_localitate.set("—")
-                return
+            def _do_cauta():
+                try:
+                    loc = cdb.get_localitate(ct) if ct else ""
+                    ani = tdb.get_ani_disponibili(ct)
+                except Exception as e:
+                    win.after(0, lambda: var_localitate.set("Eroare DB"))
+                    win.after(0, lambda: btn_cauta.configure(state="normal"))
+                    win.after(0, lambda err=str(e): messagebox.showerror(
+                        "Eroare DB", err, parent=win))
+                    return
 
-            combo_an.configure(values=[str(a) for a in ani])
-            var_an.set(str(ani[-1]))   # selectăm cel mai recent an
-            on_an_changed()            # populăm și lunile
+                def _update_ui():
+                    btn_cauta.configure(state="normal")
+                    var_localitate.set(loc if loc else "Necunoscută")
+                    if not ani:
+                        messagebox.showwarning("Contor negăsit",
+                            f"Contorul {ct} nu are date în baza de date.",
+                            parent=win)
+                        var_localitate.set("—")
+                        return
+                    combo_an.configure(values=[str(a) for a in ani])
+                    var_an.set(str(ani[-1]))
+                    on_an_changed()
+
+                win.after(0, _update_ui)
+
+            threading.Thread(target=_do_cauta, daemon=True).start()
 
         btn_cauta = _ctk_btn(frm_ct, "🔍 Caută", on_cauta_contor,
                              "primary", width=90)
@@ -1344,7 +1781,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         combo_luna.grid(row=3, column=1, sticky="w", pady=6)
 
         def on_luna_changed(*_):
-            """Afișează MZL calculat și cel manual existent pentru an+lună."""
+            """Afișează MZL calculat și cel manual existent pentru an+lună.
+            Rulează query-urile DB în thread separat — nu blochează GUI-ul."""
             ct     = var_contor.get().strip()
             an_str = var_an.get()
             luna_n = var_luna.get()
@@ -1358,43 +1796,53 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             except ValueError:
                 return
 
-            # MZL calculat automat — media ZILNICĂ (suma totală / zile valide)
-            # identic cu logica din excel_report.py (MIN_ORE_ZI ore/zi valide)
-            import sqlite3, calendar
-            try:
-                conn = tdb._conn()
-                # Pas 1: zile valide (≥22 ore înregistrate)
-                rows_zi = conn.execute("""
-                    SELECT zi, SUM(total_general) AS total_zi, COUNT(*) AS ore_zi
-                    FROM inregistrari_orare
-                    WHERE contor=? AND an=? AND luna=?
-                    GROUP BY zi
-                """, (ct, an, luna)).fetchall()
+            var_mzl_calc.set("Se calculează...")
+            var_mzl_manual.set("...")
 
-                zile_luna = calendar.monthrange(an, luna)[1]
-                zile_valide = [r for r in rows_zi if int(r["ore_zi"] or 0) >= 22]
-                n_zile_val  = len(zile_valide)
+            def _do_calcul():
+                import calendar
+                try:
+                    rows_zi = tdb._conn().execute("""
+                        SELECT zi, SUM(total_general) AS total_zi, COUNT(*) AS ore_zi
+                        FROM inregistrari_orare
+                        WHERE contor=? AND an=? AND luna=?
+                        GROUP BY zi
+                    """, (ct, an, luna)).fetchall()
 
-                if n_zile_val > 0:
-                    total_zile_valide = sum(int(r["total_zi"] or 0) for r in zile_valide)
-                    mzl_auto = round(total_zile_valide / n_zile_val)
-                    var_mzl_calc.set(
-                        f"{mzl_auto:,}  "
-                        f"({n_zile_val}/{zile_luna} zile valide)")
-                else:
-                    var_mzl_calc.set("Fără date valide (< 22 ore/zi)")
-            except Exception as e:
-                var_mzl_calc.set(f"Eroare: {e}")
+                    zile_luna   = calendar.monthrange(an, luna)[1]
+                    zile_valide = [r for r in rows_zi if int(r["ore_zi"] or 0) >= 22]
+                    n_zile_val  = len(zile_valide)
 
-            # MZL manual existent
-            manuale = tdb.get_mzl_manual(ct)
-            val_man = manuale.get((an, luna))
-            if val_man is not None:
-                var_mzl_manual.set(f"{int(val_man):,}")
-                var_mzl_nou.set(str(int(val_man)))
-            else:
-                var_mzl_manual.set("(nesetat)")
-                var_mzl_nou.set("")
+                    if n_zile_val > 0:
+                        total_zile_valide = sum(int(r["total_zi"] or 0) for r in zile_valide)
+                        mzl_auto = round(total_zile_valide / n_zile_val)
+                        mzl_calc_str = (f"{mzl_auto:,}  "
+                                        f"({n_zile_val}/{zile_luna} zile valide)")
+                    else:
+                        mzl_calc_str = "Fără date valide (< 22 ore/zi)"
+                        mzl_auto = None
+                except Exception as e:
+                    mzl_calc_str = f"Eroare: {e}"
+                    mzl_auto = None
+
+                try:
+                    manuale  = tdb.get_mzl_manual(ct)
+                    val_man  = manuale.get((an, luna))
+                except Exception:
+                    val_man = None
+
+                def _update():
+                    var_mzl_calc.set(mzl_calc_str)
+                    if val_man is not None:
+                        var_mzl_manual.set(f"{int(val_man):,}")
+                        var_mzl_nou.set(str(int(val_man)))
+                    else:
+                        var_mzl_manual.set("(nesetat)")
+                        var_mzl_nou.set("")
+
+                win.after(0, _update)
+
+            threading.Thread(target=_do_calcul, daemon=True).start()
 
         combo_luna.bind("<<ComboboxSelected>>", on_luna_changed)
         if CTK_AVAILABLE:
@@ -1597,34 +2045,68 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                         parent=win):
                 return
 
-            # ── Salvare în SQLite ─────────────────────────────────────────────
-            try:
-                tdb.upsert_mzl_manual(
-                    contor=ct, an=an, luna=luna,
-                    valoare=mzl_nou,
-                    observatii=obs,
-                    utilizator=op,
-                )
-                self._log(
-                    f"  ✏️  MZL manual [{ct}] {luna_n} {an}: "
-                    f"{val_veche_str} → {int(mzl_nou):,}  (operator: {op})"
-                )
-                messagebox.showinfo(
-                    "Salvat",
-                    f"MZL pentru contorul {ct} — {luna_n} {an}\n"
-                    f"a fost actualizat la {int(mzl_nou):,}.\n\n"
-                    f"Modificarea va fi aplicată la următoarea generare a raportului.",
-                    parent=win,
-                )
-                # Actualizăm afișarea valorii manuale în fereastră
-                var_mzl_manual.set(f"{int(mzl_nou):,}")
-                var_mzl_nou.set("")
-            except Exception as e:
-                messagebox.showerror("Eroare salvare",
-                    f"Nu s-a putut salva în baza de date:\n{e}", parent=win)
+            # ── Verificare lock înainte de salvare ───────────────────────────
+            tip_lock = f"Salvare MZL manual [{ct}] {luna_n} {an}"
+            if not self._check_lock_and_warn(tip_lock):
+                return
 
-        _ctk_btn(btn_row, "💾  Salvează",  on_salveaza,  "success",   width=150).pack(side="left", padx=8)
-        _ctk_btn(btn_row, "✖  Închide",   win.destroy,  "secondary", width=130).pack(side="left", padx=8)
+            # ── Salvare în SQLite — în thread separat ca să nu blocheze GUI ────
+            btn_salveaza_ref = [None]  # referință mutabilă, sigură între thread-uri
+
+            def _do_salvare():
+                try:
+                    tdb.upsert_mzl_manual(
+                        contor=ct, an=an, luna=luna,
+                        valoare=mzl_nou,
+                        observatii=obs,
+                        utilizator=op,
+                    )
+                    def _ok():
+                        self._log(
+                            f"  ✏️  MZL manual [{ct}] {luna_n} {an}: "
+                            f"{val_veche_str} → {int(mzl_nou):,}  (operator: {op})"
+                        )
+                        try:
+                            if win.winfo_exists():
+                                messagebox.showinfo(
+                                    "Salvat",
+                                    f"MZL pentru contorul {ct} — {luna_n} {an}\n"
+                                    f"a fost actualizat la {int(mzl_nou):,}.\n\n"
+                                    f"Modificarea va fi aplicată la următoarea generare a raportului.",
+                                    parent=win,
+                                )
+                                _on_close()
+                        except Exception:
+                            pass
+                    win.after(0, _ok)
+                except Exception as e:
+                    def _err(err=str(e)):
+                        try:
+                            if btn_salveaza_ref[0] and btn_salveaza_ref[0].winfo_exists():
+                                btn_salveaza_ref[0].configure(state="normal")
+                        except Exception:
+                            pass
+                        try:
+                            if win.winfo_exists():
+                                messagebox.showerror("Eroare salvare",
+                                    f"Nu s-a putut salva în baza de date:\n{err}", parent=win)
+                        except Exception:
+                            pass
+                    win.after(0, _err)
+                finally:
+                    self._release_lock()  # eliberăm imediat după salvare
+
+            threading.Thread(target=_do_salvare, daemon=True).start()
+
+        _btn_s = _ctk_btn(btn_row, "💾  Salvează", on_salveaza, "success", width=150)
+        _btn_s.pack(side="left", padx=8)
+        # Setăm referința după creare, folosită în thread-ul de salvare
+        try:
+            btn_salveaza_ref  # verifică dacă variabila există în scope
+            btn_salveaza_ref[0] = _btn_s
+        except NameError:
+            pass
+        _ctk_btn(btn_row, "✖  Închide",   _on_close,  "secondary", width=130).pack(side="left", padx=8)
 
         # Focus pe câmpul contor la deschidere
         entry_contor.focus_set()

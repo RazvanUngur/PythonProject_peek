@@ -1,0 +1,697 @@
+# =============================================================================
+# database.py — Gestionare baze de date SQLite
+# =============================================================================
+#
+# Două baze de date separate care lucrează împreună:
+#
+#   trafic.db   — date orare de trafic de la toate contoarele
+#   contoare.db — date de identificare contoare (drum, km, localitate, tip, IP, X, Y)
+#
+# Exportă:
+#   TrafficDB, ContoareDB
+#   get_traffic_db()   → instanță singleton TrafficDB
+#   get_contoare_db()  → instanță singleton ContoareDB
+# =============================================================================
+
+import os
+import sqlite3
+import threading
+import pandas as pd
+from datetime import datetime
+
+from config import CENTRAL_FILE_FOLDER
+
+# ── Căi fișiere DB ────────────────────────────────────────────────────────────
+DB_FOLDER   = CENTRAL_FILE_FOLDER
+TRAFFIC_DB  = os.path.join(DB_FOLDER, "trafic.db")
+CONTOARE_DB = os.path.join(DB_FOLDER, "contoare.db")
+
+# ── Singletons ────────────────────────────────────────────────────────────────
+_traffic_instance  = None
+_contoare_instance = None
+_lock = threading.Lock()
+
+# =============================================================================
+# SCHEMA — trafic.db
+# =============================================================================
+
+_TRAFFIC_SCHEMA = """
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS inregistrari_orare (
+    contor          TEXT    NOT NULL,
+    timestamp       TEXT    NOT NULL,
+    an              INTEGER NOT NULL,
+    luna            INTEGER NOT NULL,
+    zi              INTEGER NOT NULL,
+    ora             INTEGER NOT NULL,
+
+    b1_clasa_1      INTEGER DEFAULT 0,
+    b1_clasa_2      INTEGER DEFAULT 0,
+    b1_clasa_3      INTEGER DEFAULT 0,
+    b1_clasa_4      INTEGER DEFAULT 0,
+    b1_clasa_5      INTEGER DEFAULT 0,
+    b1_clasa_6      INTEGER DEFAULT 0,
+    b1_clasa_7      INTEGER DEFAULT 0,
+    b1_clasa_8      INTEGER DEFAULT 0,
+    b1_clasa_15     INTEGER DEFAULT 0,
+    total_b1        INTEGER DEFAULT 0,
+
+    b2_clasa_1      INTEGER DEFAULT 0,
+    b2_clasa_2      INTEGER DEFAULT 0,
+    b2_clasa_3      INTEGER DEFAULT 0,
+    b2_clasa_4      INTEGER DEFAULT 0,
+    b2_clasa_5      INTEGER DEFAULT 0,
+    b2_clasa_6      INTEGER DEFAULT 0,
+    b2_clasa_7      INTEGER DEFAULT 0,
+    b2_clasa_8      INTEGER DEFAULT 0,
+    b2_clasa_15     INTEGER DEFAULT 0,
+    total_b2        INTEGER DEFAULT 0,
+
+    b3_clasa_1      INTEGER DEFAULT 0,
+    b3_clasa_2      INTEGER DEFAULT 0,
+    b3_clasa_3      INTEGER DEFAULT 0,
+    b3_clasa_4      INTEGER DEFAULT 0,
+    b3_clasa_5      INTEGER DEFAULT 0,
+    b3_clasa_6      INTEGER DEFAULT 0,
+    b3_clasa_7      INTEGER DEFAULT 0,
+    b3_clasa_8      INTEGER DEFAULT 0,
+    b3_clasa_15     INTEGER DEFAULT 0,
+    total_b3        INTEGER DEFAULT 0,
+
+    b4_clasa_1      INTEGER DEFAULT 0,
+    b4_clasa_2      INTEGER DEFAULT 0,
+    b4_clasa_3      INTEGER DEFAULT 0,
+    b4_clasa_4      INTEGER DEFAULT 0,
+    b4_clasa_5      INTEGER DEFAULT 0,
+    b4_clasa_6      INTEGER DEFAULT 0,
+    b4_clasa_7      INTEGER DEFAULT 0,
+    b4_clasa_8      INTEGER DEFAULT 0,
+    b4_clasa_15     INTEGER DEFAULT 0,
+    total_b4        INTEGER DEFAULT 0,
+
+    b5_clasa_1      INTEGER DEFAULT 0,
+    b5_clasa_2      INTEGER DEFAULT 0,
+    b5_clasa_3      INTEGER DEFAULT 0,
+    b5_clasa_4      INTEGER DEFAULT 0,
+    b5_clasa_5      INTEGER DEFAULT 0,
+    b5_clasa_6      INTEGER DEFAULT 0,
+    b5_clasa_7      INTEGER DEFAULT 0,
+    b5_clasa_8      INTEGER DEFAULT 0,
+    b5_clasa_15     INTEGER DEFAULT 0,
+    total_b5        INTEGER DEFAULT 0,
+
+    b6_clasa_1      INTEGER DEFAULT 0,
+    b6_clasa_2      INTEGER DEFAULT 0,
+    b6_clasa_3      INTEGER DEFAULT 0,
+    b6_clasa_4      INTEGER DEFAULT 0,
+    b6_clasa_5      INTEGER DEFAULT 0,
+    b6_clasa_6      INTEGER DEFAULT 0,
+    b6_clasa_7      INTEGER DEFAULT 0,
+    b6_clasa_8      INTEGER DEFAULT 0,
+    b6_clasa_15     INTEGER DEFAULT 0,
+    total_b6        INTEGER DEFAULT 0,
+
+    total_general   INTEGER DEFAULT 0,
+    n_benzi         INTEGER DEFAULT 2,
+    tip_sursa       TEXT    DEFAULT 'PEEK',
+    source_file     TEXT    DEFAULT '',
+
+    PRIMARY KEY (contor, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trafic_contor
+    ON inregistrari_orare (contor);
+CREATE INDEX IF NOT EXISTS idx_trafic_contor_an_luna
+    ON inregistrari_orare (contor, an, luna);
+CREATE INDEX IF NOT EXISTS idx_trafic_an_luna
+    ON inregistrari_orare (an, luna);
+
+CREATE TABLE IF NOT EXISTS mzl_manual (
+    contor          TEXT    NOT NULL,
+    an              INTEGER NOT NULL,
+    luna            INTEGER NOT NULL,
+    mzl_valoare     REAL    NOT NULL,
+    observatii      TEXT    DEFAULT '',
+    utilizator      TEXT    DEFAULT '',
+    modificat_la    TEXT    DEFAULT '',
+
+    PRIMARY KEY (contor, an, luna)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mzl_contor
+    ON mzl_manual (contor);
+
+CREATE TABLE IF NOT EXISTS fisiere_procesate (
+    cale_fisier     TEXT    PRIMARY KEY,
+    contor          TEXT    NOT NULL,
+    tip_sursa       TEXT    NOT NULL,
+    inregistrari    INTEGER DEFAULT 0,
+    procesat_la     TEXT    NOT NULL,
+    checksum        TEXT    DEFAULT ''
+);
+"""
+
+# =============================================================================
+# SCHEMA — contoare.db
+# =============================================================================
+
+_CONTOARE_SCHEMA = """
+PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS contoare (
+    contor          TEXT    PRIMARY KEY,
+    drum            TEXT    DEFAULT '',
+    pozitie_km      TEXT    DEFAULT '',
+    localitate      TEXT    DEFAULT '',
+    tip             TEXT    DEFAULT '',
+    ip              TEXT    DEFAULT '',
+    x               REAL    DEFAULT NULL,
+    y               REAL    DEFAULT NULL,
+    lat             REAL    DEFAULT NULL,
+    lng             REAL    DEFAULT NULL,
+    activ           INTEGER DEFAULT 1,
+    adaugat_la      TEXT    DEFAULT '',
+    modificat_la    TEXT    DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_contoare_drum
+    ON contoare (drum);
+CREATE INDEX IF NOT EXISTS idx_contoare_localitate
+    ON contoare (localitate);
+"""
+
+
+# =============================================================================
+# CLASS TrafficDB
+# =============================================================================
+
+class TrafficDB:
+    def __init__(self, db_path: str = TRAFFIC_DB):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.db_path = db_path
+        self._local  = threading.local()
+        self._init_schema()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        # Reconectare dacă conexiunea e invalidă sau a fost închisă de alt proces
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except Exception:
+                conn = None
+        if conn is None:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=15,               # Asteapta max 15s la lock extern
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA cache_size = -32000")
+            conn.execute("PRAGMA busy_timeout = 10000")  # Retry automat 10s la lock
+            conn.execute("PRAGMA wal_autocheckpoint = 100")
+            self._local.conn = conn
+        return conn
+
+    def _init_schema(self):
+        conn = self._conn()
+        conn.executescript(_TRAFFIC_SCHEMA)
+        conn.commit()
+
+    def _execute_with_retry(self, sql: str, params=(), retries: int = 5,
+                             delay: float = 0.5) -> sqlite3.Cursor:
+        """
+        Execută o interogare SQL cu retry automat la OperationalError (database locked).
+        Util pentru scrieri concurente multi-utilizator pe rețea.
+        """
+        import time
+        last_err = None
+        for attempt in range(retries):
+            try:
+                conn = self._conn()
+                cur = conn.execute(sql, params)
+                conn.commit()
+                return cur
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" in str(e).lower():
+                    # Invalidam conexiunea ca sa fortam reconectare curata
+                    try:
+                        self._local.conn.close()
+                    except Exception:
+                        pass
+                    self._local.conn = None
+                    time.sleep(delay * (attempt + 1))
+                else:
+                    raise
+        raise sqlite3.OperationalError(
+            f"DB locked dupa {retries} incercari: {last_err}")
+
+
+    def upsert_hourly_df(self, df: pd.DataFrame, site_id: str,
+                         tip_sursa: str = "PEEK",
+                         source_files: list = None) -> int:
+        """
+        Inserează/actualizează date orare dintr-un DataFrame pandas.
+        Returnează numărul de rânduri scrise.
+        """
+        if df is None or df.empty:
+            return 0
+
+        df = df.copy()
+
+        # Normalizăm Timestamp
+        if "Timestamp" in df.columns:
+            df["_ts"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        elif "Data_Ora" in df.columns:
+            df["_ts"] = pd.to_datetime(df["Data_Ora"],
+                                       format="%d.%m.%Y %H:%M", errors="coerce")
+        else:
+            raise ValueError("DataFrame nu are coloana Timestamp sau Data_Ora")
+
+        df = df.dropna(subset=["_ts"])
+        if df.empty:
+            return 0
+
+        source_file_str = (
+            ", ".join(os.path.basename(f) for f in source_files)
+            if source_files else ""
+        )
+
+        n_benzi = int(df["N_Benzi"].iloc[0]) if "N_Benzi" in df.columns else 2
+
+        rows = []
+        for _, row in df.iterrows():
+            ts = row["_ts"]
+            r = {
+                "contor":    str(site_id),
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "an":        int(ts.year),
+                "luna":      int(ts.month),
+                "zi":        int(ts.day),
+                "ora":       int(ts.hour),
+                "n_benzi":   n_benzi,
+                "tip_sursa": tip_sursa,
+                "source_file": source_file_str,
+                "total_general": int(row.get("Total_General", 0)),
+            }
+            for b in range(1, 7):
+                for cls in list(range(1, 9)) + [15]:
+                    col = f"B{b}_Clasa_{cls}"
+                    r[f"b{b}_clasa_{cls}"] = int(row.get(col, 0))
+                r[f"total_b{b}"] = int(row.get(f"Total_B{b}", 0))
+            rows.append(r)
+
+        if not rows:
+            return 0
+
+        conn = self._conn()
+        cols = list(rows[0].keys())
+        placeholders = ", ".join(f":{c}" for c in cols)
+        sql = (f"INSERT OR REPLACE INTO inregistrari_orare "
+               f"({', '.join(cols)}) VALUES ({placeholders})")
+
+        conn.executemany(sql, rows)
+        conn.commit()
+
+        # Log fișiere procesate
+        if source_files:
+            for fp in source_files:
+                conn.execute("""
+                    INSERT OR REPLACE INTO fisiere_procesate
+                    (cale_fisier, contor, tip_sursa, inregistrari, procesat_la)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    os.path.abspath(fp), str(site_id), tip_sursa,
+                    len(rows), datetime.now().isoformat(timespec="seconds")
+                ))
+            conn.commit()
+
+        return len(rows)
+
+    # ── Citire date ───────────────────────────────────────────────────────────
+
+    def get_hourly_df(self, contor: str,
+                      an: int = None, luna: int = None) -> pd.DataFrame:
+        """Returnează DataFrame orar pentru un contor."""
+        params = [contor]
+        where  = "contor = ?"
+        if an is not None:
+            where += " AND an = ?"; params.append(an)
+        if luna is not None:
+            where += " AND luna = ?"; params.append(luna)
+
+        sql = f"SELECT * FROM inregistrari_orare WHERE {where} ORDER BY timestamp"
+        df = pd.read_sql_query(sql, self._conn(), params=params)
+        if df.empty:
+            return df
+
+        rename = {}
+        for b in range(1, 7):
+            for cls in list(range(1, 9)) + [15]:
+                rename[f"b{b}_clasa_{cls}"] = f"B{b}_Clasa_{cls}"
+            rename[f"total_b{b}"] = f"Total_B{b}"
+        rename["total_general"] = "Total_General"
+        rename["n_benzi"]       = "N_Benzi"
+        df = df.rename(columns=rename)
+
+        df["_ts"] = pd.to_datetime(df["timestamp"])
+        df["Data_Ora"] = df["_ts"].dt.strftime("%d.%m.%Y %H:%M")
+        df["Timestamp"] = df["_ts"]
+        df["Contor"] = df["contor"]
+        df = df.drop(columns=["_ts", "contor", "an", "luna", "zi", "ora",
+                               "tip_sursa", "source_file"], errors="ignore")
+        return df
+
+    def get_contoare_disponibile(self) -> list:
+        rows = self._conn().execute(
+            "SELECT DISTINCT contor FROM inregistrari_orare ORDER BY contor"
+        ).fetchall()
+        return [r["contor"] for r in rows]
+
+    def get_ani_disponibili(self, contor: str) -> list:
+        rows = self._conn().execute(
+            "SELECT DISTINCT an FROM inregistrari_orare "
+            "WHERE contor = ? ORDER BY an", (contor,)
+        ).fetchall()
+        return [r["an"] for r in rows]
+
+    def get_luni_disponibile(self, contor: str, an: int) -> list:
+        rows = self._conn().execute(
+            "SELECT DISTINCT luna FROM inregistrari_orare "
+            "WHERE contor = ? AND an = ? ORDER BY luna", (contor, an)
+        ).fetchall()
+        return [r["luna"] for r in rows]
+
+    def fisier_procesat(self, filepath: str) -> bool:
+        row = self._conn().execute(
+            "SELECT cale_fisier FROM fisiere_procesate WHERE cale_fisier = ?",
+            (os.path.abspath(filepath),)
+        ).fetchone()
+        return row is not None
+
+    # ── MZL manual ────────────────────────────────────────────────────────────
+
+    def upsert_mzl_manual(self, contor: str, an: int, luna: int,
+                          valoare: float, observatii: str = "",
+                          utilizator: str = "") -> None:
+        """Salvează MZL manual cu retry automat la lock multi-utilizator."""
+        self._execute_with_retry("""
+            INSERT OR REPLACE INTO mzl_manual
+            (contor, an, luna, mzl_valoare, observatii, utilizator, modificat_la)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (contor, an, luna, valoare, observatii, utilizator,
+              datetime.now().isoformat(timespec="seconds")))
+
+    def get_mzl_manual(self, contor: str) -> dict:
+        """Returnează dict {(an, luna): valoare} pentru un contor.
+        Reconectează automat dacă conexiunea e invalidă (ex: după lock extern)."""
+        try:
+            rows = self._conn().execute(
+                "SELECT an, luna, mzl_valoare FROM mzl_manual WHERE contor = ?",
+                (contor,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Forțăm reconectare și reîncercăm
+            self._local.conn = None
+            rows = self._conn().execute(
+                "SELECT an, luna, mzl_valoare FROM mzl_manual WHERE contor = ?",
+                (contor,)
+            ).fetchall()
+        return {(r["an"], r["luna"]): r["mzl_valoare"] for r in rows}
+
+    def get_all_mzl_manual(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM mzl_manual ORDER BY contor, an, luna",
+            self._conn()
+        )
+
+    # ── Statistici ────────────────────────────────────────────────────────────
+
+    def stats(self) -> dict:
+        conn = self._conn()
+        n_rows     = conn.execute("SELECT COUNT(*) FROM inregistrari_orare").fetchone()[0]
+        n_contoare = conn.execute("SELECT COUNT(DISTINCT contor) FROM inregistrari_orare").fetchone()[0]
+        n_fisiere  = conn.execute("SELECT COUNT(*) FROM fisiere_procesate").fetchone()[0]
+        size_mb    = os.path.getsize(self.db_path) / 1_048_576 if os.path.exists(self.db_path) else 0
+        return {
+            "randuri_orare": n_rows,
+            "contoare":      n_contoare,
+            "fisiere_log":   n_fisiere,
+            "size_mb":       round(size_mb, 2),
+        }
+
+    def close(self):
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+
+# =============================================================================
+# CLASS ContoareDB
+# =============================================================================
+
+class ContoareDB:
+    def __init__(self, db_path: str = CONTOARE_DB):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.db_path = db_path
+        self._local  = threading.local()
+        self._init_schema()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except Exception:
+                conn = None
+        if conn is None:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=15,
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 10000")
+            self._local.conn = conn
+        return conn
+
+    def _init_schema(self):
+        conn = self._conn()
+        conn.executescript(_CONTOARE_SCHEMA)
+        # Migrare pentru tabele existente — adăugare coloane noi dacă lipsesc
+        for _col, _tp in [("x","REAL"),("y","REAL"),("lat","REAL"),("lng","REAL")]:
+            try:
+                conn.execute(f"ALTER TABLE contoare ADD COLUMN {_col} {_tp} DEFAULT NULL")
+                conn.commit()
+            except Exception:
+                pass  # coloana există deja
+        conn.commit()
+
+    def _execute_with_retry(self, sql: str, params=(), retries: int = 5,
+                             delay: float = 0.5) -> sqlite3.Cursor:
+        """Retry automat la lock SQLite — pentru scrieri concurente multi-utilizator."""
+        import time
+        last_err = None
+        for attempt in range(retries):
+            try:
+                conn = self._conn()
+                cur = conn.execute(sql, params)
+                conn.commit()
+                return cur
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" in str(e).lower():
+                    try:
+                        self._local.conn.close()
+                    except Exception:
+                        pass
+                    self._local.conn = None
+                    time.sleep(delay * (attempt + 1))
+                else:
+                    raise
+        raise sqlite3.OperationalError(
+            f"DB locked dupa {retries} incercari: {last_err}")
+
+
+
+    def get_all(self) -> dict:
+        """Returnează dict {contor: {Drum, Pozitie_km, Localitate, Tip, IP, x, y, lat, lng}}"""
+        rows = self._conn().execute(
+            "SELECT * FROM contoare WHERE activ = 1 ORDER BY contor"
+        ).fetchall()
+        return {
+            r["contor"]: {
+                "Drum":       r["drum"],
+                "Pozitie_km": r["pozitie_km"],
+                "Localitate": r["localitate"],
+                "Tip":        r["tip"],
+                "IP":         r["ip"],
+                "x":          r["x"],
+                "y":          r["y"],
+                "lat":        r["lat"],
+                "lng":        r["lng"],
+            }
+            for r in rows
+        }
+
+    def get(self, contor: str) -> dict:
+        row = self._conn().execute(
+            "SELECT * FROM contoare WHERE contor = ?", (contor,)
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "Drum":       row["drum"],
+            "Pozitie_km": row["pozitie_km"],
+            "Localitate": row["localitate"],
+            "Tip":        row["tip"],
+            "IP":         row["ip"],
+            "x":          row["x"],
+            "y":          row["y"],
+            "lat":        row["lat"],
+            "lng":        row["lng"],
+        }
+
+    def upsert(self, contor: str, data: dict) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        existing = self._conn().execute(
+            "SELECT contor FROM contoare WHERE contor = ?", (contor,)
+        ).fetchone()
+        if existing:
+            self._execute_with_retry("""
+                UPDATE contoare
+                SET drum=?, pozitie_km=?, localitate=?, tip=?, ip=?,
+                    x=?, y=?, lat=?, lng=?, modificat_la=?, activ=1
+                WHERE contor=?
+            """, (
+                data.get("Drum", ""), data.get("Pozitie_km", ""),
+                data.get("Localitate", ""), data.get("Tip", ""),
+                data.get("IP", ""),
+                data.get("x"), data.get("y"),
+                data.get("lat"), data.get("lng"),
+                now, contor
+            ))
+        else:
+            self._execute_with_retry("""
+                INSERT INTO contoare
+                (contor, drum, pozitie_km, localitate, tip, ip,
+                 x, y, lat, lng, activ, adaugat_la, modificat_la)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """, (
+                contor, data.get("Drum", ""), data.get("Pozitie_km", ""),
+                data.get("Localitate", ""), data.get("Tip", ""),
+                data.get("IP", ""),
+                data.get("x"), data.get("y"),
+                data.get("lat"), data.get("lng"),
+                now, now
+            ))
+
+    def save_all(self, db: dict) -> None:
+        """Compatibilitate cu _save_contoare_db(db)."""
+        for contor, data in db.items():
+            self.upsert(contor, data)
+
+    def delete(self, contor: str) -> None:
+        """Soft delete cu retry."""
+        self._execute_with_retry(
+            "UPDATE contoare SET activ=0, modificat_la=? WHERE contor=?",
+            (datetime.now().isoformat(timespec="seconds"), contor)
+        )
+
+    def get_localitate(self, contor: str) -> str:
+        row = self._conn().execute(
+            "SELECT localitate FROM contoare WHERE contor = ?", (contor,)
+        ).fetchone()
+        return row["localitate"] if row else ""
+
+    def get_as_dataframe(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT contor, drum, pozitie_km, localitate, tip, ip "
+            "FROM contoare WHERE activ=1 ORDER BY contor",
+            self._conn()
+        )
+
+    def import_from_dict(self, db: dict) -> int:
+        count = 0
+        for contor, data in db.items():
+            self.upsert(contor, data)
+            count += 1
+        return count
+
+    def close(self):
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+
+# =============================================================================
+# SINGLETONS
+# =============================================================================
+
+def get_traffic_db() -> TrafficDB:
+    global _traffic_instance
+    if _traffic_instance is None:
+        with _lock:
+            if _traffic_instance is None:
+                _traffic_instance = TrafficDB()
+    return _traffic_instance
+
+
+def get_contoare_db() -> ContoareDB:
+    global _contoare_instance
+    if _contoare_instance is None:
+        with _lock:
+            if _contoare_instance is None:
+                _contoare_instance = ContoareDB()
+    return _contoare_instance
+
+
+# =============================================================================
+# MIGRARE — import date existente din JSON/Excel în SQLite
+# =============================================================================
+
+def migrate_contoare_from_json() -> int:
+    """Migrează datele de identificare contoare din formatul vechi (Excel) în contoare.db."""
+    from contoare_db import _load_contoare_db
+    db_old = _load_contoare_db()
+    if not db_old:
+        print("[MIGRARE] Nicio dată de contor găsită în sursa veche.")
+        return 0
+    n = get_contoare_db().import_from_dict(db_old)
+    print(f"[MIGRARE] {n} contoare migrate în contoare.db")
+    return n
+
+
+def migrate_traffic_from_excel(excel_folder: str,
+                                tip_sursa: str = "PEEK") -> int:
+    """Migrează date orare din Excel-urile Raport_Clase_* existente în trafic.db."""
+    import glob
+    pattern = "PEEK" if tip_sursa == "PEEK" else "VEK"
+    files = glob.glob(
+        os.path.join(excel_folder, f"Raport_Clase_{pattern}_*.xlsx"))
+
+    total = 0
+    tdb = get_traffic_db()
+    for fp in files:
+        try:
+            df = pd.read_excel(fp, sheet_name="Date Detaliate")
+            if df.empty:
+                continue
+            base    = os.path.splitext(os.path.basename(fp))[0]
+            site_id = base.split("_")[-1]
+            n = tdb.upsert_hourly_df(df, site_id,
+                                     tip_sursa=tip_sursa,
+                                     source_files=[fp])
+            print(f"  [{site_id}] {n} rânduri")
+            total += n
+        except Exception as e:
+            print(f"  Eroare {os.path.basename(fp)}: {e}")
+
+    print(f"[MIGRARE] Total: {total} rânduri orare importate în trafic.db")
+    return total

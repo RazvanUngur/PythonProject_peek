@@ -9,7 +9,7 @@ import os
 import re
 import pandas as pd
 
-from config import LOG_CLASS_MAP, BAND_COLORS, MIN_ORE_ZI
+from config import LOG_CLASS_MAP, BAND_COLORS, MIN_ORE_ZI, CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER
 from excel_report import add_charts_and_formatting
 from database import get_traffic_db
 
@@ -190,8 +190,10 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
     if not filepaths:
         return None
 
+    # output_dir = folderul pentru Raport_Clase_VEK (vine din app.py)
+    # treceri_brute se salvează separat, în folderul sursă al fiecărui contor
     if output_dir is None:
-        output_dir = os.path.dirname(os.path.abspath(filepaths[0]))
+        output_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
     os.makedirs(output_dir, exist_ok=True)
 
     # Grupam fisierele pe site_id (logica VEK: tot ce e inainte de primul "_")
@@ -233,8 +235,12 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
                 p_max = df_f["Datetime"].max().strftime("%d.%m.%Y")
                 file_periods[fname] = (p_min, p_max)
 
-        # ── 2. CSV brut ───────────────────────────────────────────────────────
-        csv_path = os.path.join(output_dir, f"{site_id}_treceri_brute.csv")
+        # ── 2. CSV brut — salvat în folderul SURSĂ al fișierelor .log ────────
+        # Folderul sursă = folderul comun al fișierelor pentru acest site_id.
+        # Dacă fișierele sunt în foldere diferite, folosim folderul primului fișier.
+        sursa_folders = list(dict.fromkeys(os.path.dirname(os.path.abspath(fp)) for fp in files))
+        csv_folder = sursa_folders[0]  # folderul rădăcină al primului fișier sursă
+        csv_path = os.path.join(csv_folder, f"{site_id}_treceri_brute.csv")
         df_all.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
         # ── 3. DataFrame orar (format identic .bin) ───────────────────────────
@@ -271,6 +277,7 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
         df_hourly["Total_General"] = df_hourly[band_tot_cols].sum(axis=1)
 
         # ── 3. Scriere în SQLite (date orare agregate) ────────────────────────
+        tdb = None
         try:
             tdb = get_traffic_db()
             n_scrise = tdb.upsert_hourly_df(
@@ -282,10 +289,67 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
         except Exception as _e_db:
             print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
 
-        # ── 4. Excel cu toate sheeturile ──────────────────────────────────────
+        # ── 4. Citire din SQLite — toate datele acumulate pentru site_id ──────
+        # Identic cu .bin: Excel-ul reflectă ÎNTREAGA perioadă din DB,
+        # nu doar fișierele procesate acum.
+        df_din_db = None
+        all_source_files_db = list(files)  # fallback: fișierele curente
+        try:
+            if tdb is not None:
+                df_din_db = tdb.get_hourly_df(site_id)
+        except Exception as _e_read:
+            print(f"  [WARN] Citire DB eroare [{site_id}]: {_e_read}")
+
+        if df_din_db is not None and not df_din_db.empty:
+            # Folosim datele complete din DB
+            df_for_excel = df_din_db.copy()
+
+            # ── Detectăm numărul real de benzi din coloana N_Benzi din DB ────
+            # Schema SQLite stochează B1..B6 hardcodat — benzile dincolo de
+            # N_Benzi sunt artefacte de schemă (zerouri), nu benzi reale.
+            # Nu folosim sum()==0 ca criteriu, pentru că o bandă defectă
+            # (zero vehicule pe toată perioada) e tot o bandă reală a contorului.
+            n_lanes_db = n_lanes  # fallback: valoarea din parsarea curentă
+            if "N_Benzi" in df_for_excel.columns:
+                n_benzi_vals = df_for_excel["N_Benzi"].dropna()
+                if not n_benzi_vals.empty:
+                    n_lanes_db = int(n_benzi_vals.max())
+
+            # Eliminăm coloanele benzilor dincolo de n_lanes_db (artefacte schemă)
+            cols_schema_drop = []
+            for b in range(n_lanes_db + 1, 7):
+                tcol = f"Total_B{b}"
+                if tcol in df_for_excel.columns:
+                    cols_schema_drop.append(tcol)
+                for cls in list(range(1, 9)) + [15]:
+                    ccol = f"B{b}_Clasa_{cls}"
+                    if ccol in df_for_excel.columns:
+                        cols_schema_drop.append(ccol)
+            if cols_schema_drop:
+                df_for_excel = df_for_excel.drop(columns=cols_schema_drop, errors="ignore")
+
+            n_lanes = n_lanes_db
+            band_tot_cols = sorted(
+                [c for c in df_for_excel.columns
+                 if c.startswith("Total_B") and c != "Total_General"],
+                key=lambda x: int(x.replace("Total_B", ""))
+            )
+            if band_tot_cols:
+                df_for_excel["Total_General"] = df_for_excel[band_tot_cols].sum(axis=1)
+
+            # Colectăm lista tuturor fișierelor sursă înregistrate în DB
+            try:
+                all_source_files_db = tdb.get_source_files(site_id) or list(files)
+            except Exception:
+                all_source_files_db = list(files)
+        else:
+            # Fallback: folosim datele tocmai parsate (prima rulare sau DB indisponibil)
+            df_for_excel = df_hourly.copy()
+
+        # ── 5. Excel cu toate sheeturile ──────────────────────────────────────
         output_fn = os.path.join(output_dir, f"Raport_Clase_VEK_{site_id}.xlsx")
 
-        df_export = df_hourly.drop(columns=["N_Benzi"], errors="ignore")
+        df_export = df_for_excel.drop(columns=["N_Benzi", "Timestamp"], errors="ignore")
         df_export = df_export.reset_index(drop=True)
 
         df_export.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
@@ -293,28 +357,29 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
         all_band_totals = sum(df_export[c].sum() for c in band_tot_cols
                               if c in df_export.columns)
 
-        df_for_charts = df_hourly.copy()
+        df_for_charts = df_for_excel.copy()
         df_for_charts["Timestamp"] = pd.to_datetime(
             df_for_charts["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce")
 
         if all_band_totals > 0:
             add_charts_and_formatting(output_fn, df_for_charts, site_id,
-                                      source_files=files,
+                                      source_files=all_source_files_db,
                                       source_file_periods=file_periods)
         else:
             print(f"Atentie: Contorul LOG {site_id} are trafic zero.")
 
-        suma_b1 = df_hourly["Total_B1"].sum() if "Total_B1" in df_hourly.columns else 0
-        suma_b2 = df_hourly["Total_B2"].sum() if "Total_B2" in df_hourly.columns else 0
+        suma_b1 = df_for_excel["Total_B1"].sum() if "Total_B1" in df_for_excel.columns else 0
+        suma_b2 = df_for_excel["Total_B2"].sum() if "Total_B2" in df_for_excel.columns else 0
 
         rezultate.append({
-            "path":    output_fn,
-            "id":      site_id,
-            "randuri": len(df_export),
-            "b1":      int(suma_b1),
-            "b2":      int(suma_b2),
-            "n_lanes": n_lanes,
-            "source_files": files,
+            "path":       output_fn,
+            "id":         site_id,
+            "randuri":    len(df_export),
+            "b1":         int(suma_b1),
+            "b2":         int(suma_b2),
+            "n_lanes":    n_lanes,
+            "source_files": all_source_files_db,
+            "csv_path":   csv_path,
         })
 
         # Notifică GUI progresul după fiecare contor complet

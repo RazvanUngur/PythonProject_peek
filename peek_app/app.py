@@ -27,7 +27,8 @@ except ImportError:
 
 from config import (
     CTK_THEME, CTK_COLOR,
-    CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME, FONT_SMALL, FONT_MONO,
+    CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME, RAPOARTE_PEEK_FOLDER,
+    FONT_SMALL, FONT_MONO,
     BG_APP, BG_CARD, BG_LOG, BG_TITLE, FG_TITLE, RADIUS,
 )
 from bin_parser import quick_scan_bin, process_multiple_files
@@ -39,6 +40,7 @@ from gui_widgets import (
     _ctk_entry, _add_logo_header, _open_contor_dialog,
 )
 
+from harta_server import HartaServer
 
 class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
@@ -115,6 +117,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         self.processing_thread = None
 
         self._setup_ui()
+
+        # ── Server hartă (Flask, thread daemon) ──────────────────────────────
+        self._harta_server = HartaServer()
+        self._harta_server.start()
 
         # ── Sincronizare contoare.db la pornire ───────────────────────────────
         # Dacă contoare.db e gol și Excel-ul centralizator are date,
@@ -344,6 +350,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                      self._sorteaza_bin_dialog, "warning", width=230)
         self.btn_sorteaza.pack(side="left", padx=6)
 
+        self.btn_harta = _ctk_btn(row_actions2, "🗺️  Hartă Contoare",
+                                  self._open_harta, "navy", width=190)
+        self.btn_harta.pack(side="left", padx=6)
+
         # ── Progress bar ──────────────────────────────────────────────────────
         if CTK_AVAILABLE:
             self.progress = ctk.CTkProgressBar(self, width=560, height=14,
@@ -392,6 +402,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         _ctk_label(p, "PEEK Traffic Analyzer",
                    font=("Segoe UI", 20, "bold"),
                    text_color="#C0392B").pack(pady=(20, 6))
+
+    def _open_harta(self):
+        """Deschide harta contoare în browser-ul default."""
+        self._harta_server.open_in_browser()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Sortare .bin după post
@@ -965,14 +979,14 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._log(f"{sep}\n")
 
             self._update_progress(100, f"✔  Finalizat — {n_contoare} contoar{'e' if n_contoare!=1 else ''} procesat{'e' if n_contoare!=1 else ''}.")
-            out_dir = os.path.dirname(os.path.abspath(self.selected_files[0]))
+            rapoarte_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
             messagebox.showinfo(
                 "Succes",
                 f"Procesare finalizată!\n\n"
                 f"Contoar{'e' if n_contoare!=1 else ''} procesat{'e' if n_contoare!=1 else ''}:   {n_contoare}\n"
                 f"Fișiere:              {fisiere_valide}/{total}{goale_str}\n"
                 f"Înregistrări orare:   {total_ore:,}\n\n"
-                f"Rapoartele au fost salvate în:\n{out_dir}",
+                f"Rapoartele au fost salvate în:\n{rapoarte_dir}",
             )
         except Exception as e:
             import traceback
@@ -1093,8 +1107,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     "Se genereaza rapoartele Excel (.log)...")
                 self._log("  🔄 Generare rapoarte Excel (.log)...")
 
-                out_dir = os.path.dirname(
-                    os.path.abspath(self.selected_log_files[0]))
+                out_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+                os.makedirs(out_dir, exist_ok=True)
                 rezultate_log = process_log_files(
                     self.selected_log_files,
                     output_dir=out_dir,
@@ -1289,7 +1303,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     "Se genereaza rapoartele Excel (.log)...")
                 self._log("  🔄 Generare rapoarte Excel (.log)...")
 
-                out_dir = os.path.dirname(os.path.abspath(self.selected_log_files[0]))
+                out_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+                os.makedirs(out_dir, exist_ok=True)
 
                 # ── Callback progres per contor .log ─────────────────────
                 _log_proc_start = log_pct_start + 5
@@ -1442,8 +1457,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
         win.title("Gestionare Contoare")
         win.resizable(True, True)
-        win.minsize(720, 460)
-        W, H = 880, 580
+        win.minsize(1000, 460)
+        W, H = 1150, 580
         sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
         win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
         win.grab_set()
@@ -1473,18 +1488,22 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                   background=[("selected", "#2471A3")],
                   foreground=[("selected", "white")])
 
-        cols = ("Contor", "Drum", "Poziție km", "Localitate", "Tip", "IP")
+        cols = ("Contor", "Drum", "Poziție km", "Localitate", "Tip", "IP",
+                "DRDP", "Lat", "Lng")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                             height=14, style="Peek.Treeview")
-        cw = {"Contor": 75, "Drum": 95, "Poziție km": 85,
-              "Localitate": 140, "Tip": 180, "IP": 125}
+        cw = {"Contor": 70, "Drum": 85, "Poziție km": 80,
+              "Localitate": 130, "Tip": 160, "IP": 115,
+              "DRDP": 90, "Lat": 95, "Lng": 95}
         for c in cols:
             tree.heading(c, text=c)
-            tree.column(c, width=cw.get(c, 100), anchor="center")
+            tree.column(c, width=cw.get(c, 90), anchor="center")
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right",  fill="y")
+        hsb.pack(side="bottom", fill="x")
         tree.pack(fill="both", expand=True)
 
         if CTK_AVAILABLE:
@@ -1498,14 +1517,57 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         for col in range(4):
             btn_outer.columnconfigure(col, weight=1, uniform="mgr")
 
+        def _get_contor_data_merged(ct_id):
+            """
+            Returnează datele unui contor îmbinate din ambele surse:
+            SQLite contoare.db (primar, are DRDP/lat/lng) + Excel (fallback).
+            """
+            data = {}
+            # Întâi Excel (date de bază vechi)
+            db_excel = _load_contoare_db()
+            if ct_id in db_excel:
+                data.update(db_excel[ct_id])
+            # Suprascrie cu datele din SQLite (mai recente, inclusiv DRDP/lat/lng)
+            try:
+                from database import get_contoare_db
+                d_sql = get_contoare_db().get(ct_id)
+                if d_sql:
+                    data.update(d_sql)
+            except Exception:
+                pass
+            return data
+
         def refresh_tree():
             for row in tree.get_children():
                 tree.delete(row)
-            db = _load_contoare_db()
-            for ct, d in sorted(db.items()):
+            # Citim din SQLite — sursa principală (are DRDP/lat/lng)
+            try:
+                from database import get_contoare_db
+                db_sql = get_contoare_db().get_all()
+            except Exception:
+                db_sql = {}
+            # Fallback: completăm cu contoare din Excel care nu sunt încă în SQLite
+            db_excel = _load_contoare_db()
+            ct_ids = sorted(set(list(db_sql.keys()) + list(db_excel.keys())))
+
+            def _fmt_coord(v):
+                try:
+                    return f"{float(v):.6f}" if v not in ("", None) else ""
+                except Exception:
+                    return str(v) if v else ""
+
+            for ct in ct_ids:
+                d = db_sql.get(ct) or db_excel.get(ct) or {}
                 tree.insert("", "end", values=(
-                    ct, d.get("Drum",""), d.get("Pozitie_km",""),
-                    d.get("Localitate",""), d.get("Tip",""), d.get("IP",""),
+                    ct,
+                    d.get("Drum","") or d.get("drum",""),
+                    d.get("Pozitie_km","") or d.get("pozitie_km",""),
+                    d.get("Localitate","") or d.get("localitate",""),
+                    d.get("Tip","") or d.get("tip",""),
+                    d.get("IP","") or d.get("ip",""),
+                    d.get("DRDP","") or d.get("drdp",""),
+                    _fmt_coord(d.get("lat") or d.get("Lat") or ""),
+                    _fmt_coord(d.get("lng") or d.get("Lng") or ""),
                 ))
 
         def on_adauga():
@@ -1518,10 +1580,9 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 return
             vals = tree.item(sel[0])["values"]
             ct_id = str(vals[0])
-            db = _load_contoare_db()
             _open_contor_dialog(win, mode="edit", ct_id=ct_id,
-                                data=db.get(ct_id,{}), on_save=refresh_tree,
-                                app_ref=self)
+                                data=_get_contor_data_merged(ct_id),
+                                on_save=refresh_tree, app_ref=self)
 
         def on_sterge():
             sel = tree.selection()

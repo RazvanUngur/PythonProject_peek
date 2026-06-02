@@ -19,10 +19,10 @@ import threading
 import pandas as pd
 from datetime import datetime
 
-from config import CENTRAL_FILE_FOLDER
+from config import CENTRAL_FILE_FOLDER, SQLITE_FOLDER
 
 # ── Căi fișiere DB ────────────────────────────────────────────────────────────
-DB_FOLDER   = CENTRAL_FILE_FOLDER
+DB_FOLDER   = os.path.join(CENTRAL_FILE_FOLDER, SQLITE_FOLDER)
 TRAFFIC_DB  = os.path.join(DB_FOLDER, "trafic.db")
 CONTOARE_DB = os.path.join(DB_FOLDER, "contoare.db")
 
@@ -143,6 +143,27 @@ CREATE TABLE IF NOT EXISTS mzl_manual (
 CREATE INDEX IF NOT EXISTS idx_mzl_contor
     ON mzl_manual (contor);
 
+CREATE TABLE IF NOT EXISTS trafic_mzl (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    contor          TEXT    NOT NULL,
+    an              INTEGER NOT NULL,
+    luna            INTEGER NOT NULL,
+    mzl_calculat    REAL    NOT NULL,
+    mzl_final       REAL    NOT NULL,
+    este_manual     INTEGER DEFAULT 0,
+    indicator       TEXT    DEFAULT '',
+    zile_valide     INTEGER DEFAULT 0,
+    zile_luna       INTEGER DEFAULT 0,
+    calculat_la     TEXT    DEFAULT '',
+
+    UNIQUE (contor, an, luna)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trafic_mzl_contor
+    ON trafic_mzl (contor);
+CREATE INDEX IF NOT EXISTS idx_trafic_mzl_contor_an
+    ON trafic_mzl (contor, an);
+
 CREATE TABLE IF NOT EXISTS fisiere_procesate (
     cale_fisier     TEXT    PRIMARY KEY,
     contor          TEXT    NOT NULL,
@@ -171,6 +192,7 @@ CREATE TABLE IF NOT EXISTS contoare (
     y               REAL    DEFAULT NULL,
     lat             REAL    DEFAULT NULL,
     lng             REAL    DEFAULT NULL,
+    drdp            TEXT    DEFAULT '',
     activ           INTEGER DEFAULT 1,
     adaugat_la      TEXT    DEFAULT '',
     modificat_la    TEXT    DEFAULT ''
@@ -387,6 +409,19 @@ class TrafficDB:
         ).fetchall()
         return [r["luna"] for r in rows]
 
+    def get_source_files(self, contor: str) -> list:
+        """
+        Returnează lista căilor complete ale fișierelor sursă procesate
+        pentru un contor, în ordinea procesării.
+        Folosit de log_parser pentru a popula secțiunea Fișiere sursă din Excel.
+        """
+        rows = self._conn().execute(
+            "SELECT cale_fisier FROM fisiere_procesate "
+            "WHERE contor = ? ORDER BY procesat_la",
+            (contor,)
+        ).fetchall()
+        return [r["cale_fisier"] for r in rows]
+
     def fisier_procesat(self, filepath: str) -> bool:
         row = self._conn().execute(
             "SELECT cale_fisier FROM fisiere_procesate WHERE cale_fisier = ?",
@@ -427,6 +462,52 @@ class TrafficDB:
     def get_all_mzl_manual(self) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT * FROM mzl_manual ORDER BY contor, an, luna",
+            self._conn()
+        )
+
+    # ── trafic_mzl ────────────────────────────────────────────────────────────
+
+    def upsert_trafic_mzl(self, contor: str, an: int, luna: int,
+                           mzl_calculat: float, mzl_final: float,
+                           este_manual: int = 0, indicator: str = "",
+                           zile_valide: int = 0, zile_luna: int = 0) -> None:
+        """
+        Inserează/actualizează MZL final în trafic_mzl.
+        mzl_calculat = valoarea calculată automat din Date prelucrate (înainte de override manual).
+        mzl_final    = valoarea folosită efectiv în raport (după override manual dacă există).
+        este_manual  = 1 dacă mzl_final provine din mzl_manual, 0 dacă e calculat automat.
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._execute_with_retry("""
+            INSERT INTO trafic_mzl
+                (contor, an, luna, mzl_calculat, mzl_final,
+                 este_manual, indicator, zile_valide, zile_luna, calculat_la)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(contor, an, luna) DO UPDATE SET
+                mzl_calculat = excluded.mzl_calculat,
+                mzl_final    = excluded.mzl_final,
+                este_manual  = excluded.este_manual,
+                indicator    = excluded.indicator,
+                zile_valide  = excluded.zile_valide,
+                zile_luna    = excluded.zile_luna,
+                calculat_la  = excluded.calculat_la
+        """, (contor, an, luna, mzl_calculat, mzl_final,
+               este_manual, indicator, zile_valide, zile_luna, now))
+
+    def get_trafic_mzl(self, contor: str, an: int = None) -> pd.DataFrame:
+        """Returnează DataFrame cu MZL final pentru un contor, opțional filtrat pe an."""
+        params = [contor]
+        where  = "contor = ?"
+        if an is not None:
+            where += " AND an = ?"; params.append(an)
+        return pd.read_sql_query(
+            f"SELECT * FROM trafic_mzl WHERE {where} ORDER BY an, luna",
+            self._conn(), params=params
+        )
+
+    def get_all_trafic_mzl(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM trafic_mzl ORDER BY contor, an, luna",
             self._conn()
         )
 
@@ -485,7 +566,7 @@ class ContoareDB:
         conn = self._conn()
         conn.executescript(_CONTOARE_SCHEMA)
         # Migrare pentru tabele existente — adăugare coloane noi dacă lipsesc
-        for _col, _tp in [("x","REAL"),("y","REAL"),("lat","REAL"),("lng","REAL")]:
+        for _col, _tp in [("x","REAL"),("y","REAL"),("lat","REAL"),("lng","REAL"),("drdp","TEXT DEFAULT ''")]:
             try:
                 conn.execute(f"ALTER TABLE contoare ADD COLUMN {_col} {_tp} DEFAULT NULL")
                 conn.commit()
@@ -536,6 +617,7 @@ class ContoareDB:
                 "y":          r["y"],
                 "lat":        r["lat"],
                 "lng":        r["lng"],
+                "DRDP":       r["drdp"] if r["drdp"] is not None else "",
             }
             for r in rows
         }
@@ -556,6 +638,7 @@ class ContoareDB:
             "y":          row["y"],
             "lat":        row["lat"],
             "lng":        row["lng"],
+            "DRDP":       row["drdp"] if row["drdp"] is not None else "",
         }
 
     def upsert(self, contor: str, data: dict) -> None:
@@ -567,7 +650,7 @@ class ContoareDB:
             self._execute_with_retry("""
                 UPDATE contoare
                 SET drum=?, pozitie_km=?, localitate=?, tip=?, ip=?,
-                    x=?, y=?, lat=?, lng=?, modificat_la=?, activ=1
+                    x=?, y=?, lat=?, lng=?, drdp=?, modificat_la=?, activ=1
                 WHERE contor=?
             """, (
                 data.get("Drum", ""), data.get("Pozitie_km", ""),
@@ -575,20 +658,22 @@ class ContoareDB:
                 data.get("IP", ""),
                 data.get("x"), data.get("y"),
                 data.get("lat"), data.get("lng"),
+                data.get("DRDP", ""),
                 now, contor
             ))
         else:
             self._execute_with_retry("""
                 INSERT INTO contoare
                 (contor, drum, pozitie_km, localitate, tip, ip,
-                 x, y, lat, lng, activ, adaugat_la, modificat_la)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                 x, y, lat, lng, drdp, activ, adaugat_la, modificat_la)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """, (
                 contor, data.get("Drum", ""), data.get("Pozitie_km", ""),
                 data.get("Localitate", ""), data.get("Tip", ""),
                 data.get("IP", ""),
                 data.get("x"), data.get("y"),
                 data.get("lat"), data.get("lng"),
+                data.get("DRDP", ""),
                 now, now
             ))
 
@@ -612,7 +697,7 @@ class ContoareDB:
 
     def get_as_dataframe(self) -> pd.DataFrame:
         return pd.read_sql_query(
-            "SELECT contor, drum, pozitie_km, localitate, tip, ip "
+            "SELECT contor, drum, pozitie_km, localitate, tip, ip, drdp "
             "FROM contoare WHERE activ=1 ORDER BY contor",
             self._conn()
         )

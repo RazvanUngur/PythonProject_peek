@@ -630,6 +630,10 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     # Dict tip_zi per zi — folosit de centralizator pentru Mod funcționare
     _dp_tip_zi_map = {}
 
+    # Dict clase reconstruite per zi — {zi_date: {banda: {clasa: val}}}
+    # Folosit de MZL pentru a prelua distribuția corectă (post-reconstrucție)
+    _dp_ocls_map = {}
+
     _dp_row = 4
     for _, _rz in _daily_dp.iterrows():
         _zi_date = _rz['_zi']
@@ -659,7 +663,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                     _ocls[_b] = _recon(_rcls[_pb], _rtot[_pb], _rtot[_b])
                     _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
                 else:
-                    _ocls[_b] = {_c: 0 for _c in CLASE_IDX}
+                    # Pereche neutilizabilă — totalul merge în Clasa_15 (vehicule neidentificate)
+                    _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_b]) for _c in CLASE_IDX}
                     _otot[_b] = _rtot[_b]; _osrc[_b] = 'T'; _tip_zi = 'totalizator'
 
             else:  # D
@@ -684,8 +689,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                         _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
 
                 elif _spb == 'T':
-                    # Pereche totalizatoare → preia totalul perechii
-                    _ocls[_b] = {_c: 0 for _c in CLASE_IDX}
+                    # Pereche totalizatoare → preia totalul perechii în Clasa_15 (vehicule neidentificate)
+                    _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_pb]) for _c in CLASE_IDX}
                     _otot[_b] = _rtot[_pb]; _osrc[_b] = 'T'; _tip_zi = 'totalizator'
 
                 else:  # pb == D, ambele defecte → caută alt sens
@@ -702,6 +707,11 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
         if _null_zi: _tip_zi = 'null'
         _dp_tip_zi_map[_zi_date] = _tip_zi
+        # Salvăm clasele și totalurile reconstruite pentru această zi (folosite de MZL)
+        _dp_ocls_map[_zi_date] = {
+            'cls': {_b: dict(_ocls[_b]) for _b in band_ids},
+            'tot': {_b: _otot[_b] for _b in band_ids},
+        }
 
         # Scriere rând
         import datetime as _dtm
@@ -904,112 +914,86 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 df_calcul = pd.DataFrame(); divisor = 0
 
         if divisor > 0 and not df_calcul.empty:
-            # ── MZL din Date prelucrate — valorile reconstruite per clasă ──────
-            # Colectăm zilele valide din luna curentă care există în _daily_dp
-            zile_valide_luna = df_calcul['Zi'].unique() if 'Zi' in df_calcul.columns else []
 
-            sume_dp = {f'Clasa_{i}': 0 for i in range(1, 9)}
-            sume_dp['Clasa_15'] = 0
-            n_zile_dp = 0
+            if 'Zi' in df_calcul.columns:
+                zile_valide_luna = [
+                    z.date() if hasattr(z, 'date') else z
+                    for z in df_calcul['Zi'].unique()
+                ]
+            else:
+                zile_valide_luna = []
+
+            totaluri_zilnice = []  # păstrat pentru compatibilitate — neutilizat după refactorizare
+
+            sume_clase = {f'Clasa_{i}': 0 for i in range(1, 9)}
+            sume_clase['Clasa_15'] = 0
+            n_zile_cls = 0  # număr zile care au contribuit la sume_clase
 
             for _zi_d in zile_valide_luna:
-                # Găsim rândul din _daily_dp
+
                 _dp_row_zi = _daily_dp[_daily_dp['_zi'] == _zi_d]
+
                 if _dp_row_zi.empty:
                     continue
+
                 _tip = _dp_tip_zi_map.get(_zi_d, 'null')
+
                 if _tip == 'null':
-                    continue   # zi neutilizabilă → excludem
+                    continue
 
-                # Suma claselor reconstruite (din out_cls per toate benzile)
-                # Reconstrucție rapidă pentru clase
-                _rz   = _dp_row_zi.iloc[0]
-                _stat_b = {}; _rcls_b = {}; _rtot_b = {}
-                for _b in band_ids:
-                    _t = int(_rz.get(f'Total_B{_b}', 0))
-                    _c = int(_rz.get(f'B{_b}_Clasa_15', 0))
-                    _stat_b[_b] = 'D' if _t == 0 else ('T' if _t > 0 and _c/_t > PRAG_TOT_DP else 'C')
-                    _rtot_b[_b] = _t
-                    _rcls_b[_b] = {_ci: int(_rz.get(f'B{_b}_Clasa_{_ci}', 0))
-                                   for _ci in CLASE_IDX}
+                # TOTAL ȘI CLASE DIN DATE PRELUCRATE (post-reconstrucție benzi)
+                # Se folosesc valorile din _dp_ocls_map — consistente între ele.
+                # Benzile T fără pereche utilizabilă au totalul pus în Clasa_15,
+                # deci suma(clase) == total_zi întotdeauna.
+                _dp_zi = _dp_ocls_map.get(_zi_d, {})
+                _ocls_zi = _dp_zi.get('cls', {})
+                _otot_zi = _dp_zi.get('tot', {})
 
+                total_zi = sum(_otot_zi.get(_b, 0) for _b in band_ids)
+
+                if total_zi == 0:
+                    continue
+
+                n_zile_cls += 1
                 for _cls_i in list(range(1, 9)) + [15]:
-                    _col_key = f'Clasa_{_cls_i}'
-                    _val_cls = 0
+                    val_cls = 0
                     for _b in band_ids:
-                        _pb = perechi.get(_b, _b)
-                        if _stat_b[_b] == 'C':
-                            _val_cls += max(0, _rcls_b[_b].get(_cls_i, 0))
-                        elif _stat_b[_b] == 'T':
-                            # T: distribuție proporțională din pereche dacă e C
-                            if _stat_b.get(_pb, 'D') == 'C' and _rtot_b.get(_pb, 0) > 0:
-                                _donor_cls_val = _rcls_b[_pb].get(_cls_i, 0)
-                                if _donor_cls_val == 0:
-                                    pass  # donorul 0 → rezultatul 0
-                                else:
-                                    _ratio = _donor_cls_val / _rtot_b[_pb]
-                                    _val_cls += max(0, round(_ratio * _rtot_b[_b]))
-                            # dacă pereche nu e C → 0 clase (totalizator pur)
-                        else:  # D — preia clasele perechii direct
-                            if _stat_b.get(_pb, 'D') == 'C':
-                                _val_cls += max(0, _rcls_b[_pb].get(_cls_i, 0))
-                    sume_dp[_col_key] += max(0, _val_cls)
-                n_zile_dp += 1
+                        val_cls += _ocls_zi.get(_b, {}).get(_cls_i, 0)
+                    sume_clase[f'Clasa_{_cls_i}'] += val_cls
+
+            n_zile_dp = n_zile_cls  # contor unic — clase și total din același set de zile
 
             if n_zile_dp > 0:
-                medii = {f'Clasa_{i}': round(sume_dp[f'Clasa_{i}'] / n_zile_dp)
-                         for i in range(1, 9)}
-                medii['Clasa_15'] = round(sume_dp['Clasa_15'] / n_zile_dp)
-                medii['Total']    = sum(medii.values())
-            else:
-                # Fallback la calculul clasic dacă Date prelucrate nu are date
-                sume = {}
+
+                medii = {}
+
                 for i in range(1, 9):
-                    sume[f'Clasa_{i}'] = (df_calcul[f'B1_Clasa_{i}'].sum() +
-                                           df_calcul[f'B2_Clasa_{i}'].sum())
-                sume['Clasa_15'] = (df_calcul['B1_Clasa_15'].sum() +
-                                     df_calcul['B2_Clasa_15'].sum())
-                medii = {f'Clasa_{i}': round(sume[f'Clasa_{i}'] / divisor) for i in range(1, 9)}
-                medii['Clasa_15'] = round(sume['Clasa_15'] / divisor)
-                medii['Total']    = sum(medii.values())
+                    medii[f'Clasa_{i}'] = round(
+                        sume_clase[f'Clasa_{i}'] / n_zile_dp
+                    )
+
+                medii['Clasa_15'] = round(
+                    sume_clase['Clasa_15'] / n_zile_dp
+                )
+
+                # Total = suma mediilor pe clase — garantat consistent
+                # deoarece fiecare zi are suma(clase) == total_zi
+                medii['Total'] = sum(
+                    medii[f'Clasa_{i}'] for i in range(1, 9)
+                ) + medii['Clasa_15']
+
+            else:
+
+                medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
+                medii['Clasa_15'] = 0
+                medii['Total'] = 0
         else:
             medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
             medii['Clasa_15'] = 0; medii['Total'] = 0
         an, luna = row['An'], row['Luna']
         df_luna_valida = df_valid[(df_valid['An'] == an) & (df_valid['Luna'] == luna)]
-        nr_zile_valide = df_luna_valida['Zi'].nunique() if len(df_luna_valida) > 0 else 0
-        zile_in_luna   = calendar.monthrange(an, luna)[1]
-
-        if nr_zile_valide == zile_in_luna:
-            indicator, color = "Date complete", "NORMAL"
-            df_calcul = df_luna_valida; divisor = zile_in_luna
-        elif nr_zile_valide >= MIN_ZILE_LUNA:
-            indicator, color = "Date parțiale", "YELLOW"
-            df_calcul = df_luna_valida; divisor = nr_zile_valide
-        else:
-            has_7, week_dates = check_7_consecutive_days(df, an, luna)
-            if has_7:
-                indicator, color = "Date parțiale - 7 zile", "YELLOW"
-                df_calcul = df[df['Zi'].isin(week_dates)]; divisor = 7
-            else:
-                indicator, color = "Nu există date", "ORANGE"
-                df_calcul = pd.DataFrame(); divisor = 0
-
-        if divisor > 0 and not df_calcul.empty:
-            sume = {}
-            for i in range(1, 9):
-                sume[f'Clasa_{i}'] = (df_calcul[f'B1_Clasa_{i}'].sum() +
-                                       df_calcul[f'B2_Clasa_{i}'].sum())
-            sume['Clasa_15'] = (df_calcul['B1_Clasa_15'].sum() +
-                                 df_calcul['B2_Clasa_15'].sum())
-            medii = {f'Clasa_{i}': round(sume[f'Clasa_{i}'] / divisor) for i in range(1, 9)}
-            medii['Clasa_15'] = round(sume['Clasa_15'] / divisor)
-            medii['Total']    = sum(medii.values())
-        else:
-            medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
-            medii['Clasa_15'] = 0; medii['Total'] = 0
-
         # Mod funcționare lunar = tipul zilei majoritar din Date prelucrate
+        # (bucla de recalcul raw eliminată — MZL vine exclusiv din Date prelucrate)
         # pentru zilele din luna an/luna
         _tip_counts = {'clasificator': 0, 'totalizator': 0, 'null': 0}
         for _zi_d, _tip in _dp_tip_zi_map.items():
@@ -1028,6 +1012,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             'Zile_cu_inregistrari': f"{nr_zile_valide}/{zile_in_luna}",
             'Are_date_valide': (divisor > 0),
             'Mod_functionare': mod_functionare_lunar,
+            'MZL_Calculat': medii.get('Total', 0),  # valoarea auto ÎNAINTE de override manual
         })
 
     # ── Aplică suprascrierile manuale ─────────────────────────────────────────
@@ -1048,6 +1033,42 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             entry['Total']    = mzl_m
             entry['Color']    = 'MANUAL'
             entry['Indicator'] = f"Prelucrare manuală (MZL={mzl_m})"
+
+    # ── Salvăm MZL în trafic_mzl (tabel dedicat, separat de mzl_manual) ─────────
+    # mzl_calculat = valoarea calculată automat din Date prelucrate (înainte de override).
+    # mzl_final    = valoarea efectivă din raport (după override manual dacă există).
+    # mzl_manual   rămâne neatins — conține doar corecțiile introduse manual din GUI.
+    try:
+        from database import get_traffic_db as _get_tdb_save
+        _tdb_save = _get_tdb_save()
+        # Construim un dict {(an, luna): mzl_calculat} ÎNAINTE de suprascrieri manuale
+        # lunar_data_calculat e deja disponibil mai sus (înainte de blocul de overrides);
+        # folosim câmpul 'MZL_Calculat' pe care îl adăugăm mai jos în append.
+        for _entry in lunar_data:
+            _mzl_final     = _entry.get('Total', 0) or 0
+            _mzl_calculat  = _entry.get('MZL_Calculat', _mzl_final)  # salvat înainte de override
+            _este_manual   = 1 if _entry.get('Color') == 'MANUAL' else 0
+            _indicator     = _entry.get('Indicator', '')
+            # Extragem nr_zile_valide și zile_luna din câmpul 'Zile_cu_inregistrari' (ex: "28/31")
+            _zile_str      = _entry.get('Zile_cu_inregistrari', '0/0')
+            try:
+                _zv, _zl = [int(x) for x in str(_zile_str).split('/')]
+            except Exception:
+                _zv, _zl = 0, 0
+            # Salvăm toate lunile (inclusiv cele cu Total=0 — pot fi relevante ca absență de date)
+            _tdb_save.upsert_trafic_mzl(
+                contor=str(site_id),
+                an=int(_entry['An']),
+                luna=int(_entry['Luna']),
+                mzl_calculat=float(_mzl_calculat),
+                mzl_final=float(_mzl_final),
+                este_manual=_este_manual,
+                indicator=_indicator,
+                zile_valide=_zv,
+                zile_luna=_zl,
+            )
+    except Exception as _e_mzl_save:
+        print(f"[WARN] Nu s-a putut salva trafic_mzl pentru {site_id}: {_e_mzl_save}")
 
     # headers_lunar definit ÎNAINTE de merge_cells care îl folosește
     headers_lunar = ["Post","An","Luna","Clasa 1","Clasa 2","Clasa 3","Clasa 4",

@@ -212,7 +212,7 @@ def _open_contor_dialog(parent, mode="add", ct_id=None, data=None, on_save=None,
     win.grab_set()
     win.focus_force()
 
-    W, H = 460, 440
+    W, H = 460, 560
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
 
@@ -270,6 +270,38 @@ def _open_contor_dialog(parent, mode="add", ct_id=None, data=None, on_save=None,
 
     add_field("IP", "ip", 5, data.get("IP",""))
 
+    # DRDP dropdown
+    if CTK_AVAILABLE:
+        ctk.CTkLabel(grid, text="DRDP", font=FONT_SMALL,
+                     anchor="e", width=110).grid(row=6, column=0, padx=(0,8), pady=6, sticky="e")
+    else:
+        tk.Label(grid, text="DRDP", font=FONT_SMALL,
+                 anchor="e", width=14).grid(row=6, column=0, padx=(0,8), pady=6, sticky="e")
+
+    DRDP_OPTIONS = ["", "București", "Craiova", "Timișoara", "Cluj",
+                    "Brașov", "Iași", "Constanța", "Buzău"]
+    drdp_initial = data.get("DRDP", "") or data.get("drdp", "")
+    var_drdp = tk.StringVar(value=drdp_initial)
+    if CTK_AVAILABLE:
+        ctk.CTkComboBox(grid, variable=var_drdp, values=DRDP_OPTIONS,
+                        width=240, height=30, state="readonly",
+                        corner_radius=6).grid(row=6, column=1, pady=6, sticky="w")
+    else:
+        ttk.Combobox(grid, textvariable=var_drdp, values=DRDP_OPTIONS,
+                     state="readonly", width=28).grid(row=6, column=1, pady=6, sticky="w")
+    vars_["drdp"] = var_drdp
+
+    # Lat / Lng — câmpuri numerice libere
+    def _coord_initial(key_upper, key_lower):
+        v = data.get(key_upper) or data.get(key_lower) or ""
+        try:
+            return f"{float(v):.6f}" if v not in ("", None) else ""
+        except Exception:
+            return str(v) if v else ""
+
+    add_field("Latitudine", "lat", 7, _coord_initial("lat", "Lat"))
+    add_field("Longitudine", "lng", 8, _coord_initial("lng", "Lng"))
+
     # Separator + butoane
     if CTK_AVAILABLE:
         ctk.CTkFrame(win, height=1, fg_color="#CCCCCC").pack(fill="x", padx=20, pady=(10, 4))
@@ -291,7 +323,23 @@ def _open_contor_dialog(parent, mode="add", ct_id=None, data=None, on_save=None,
             "Localitate": vars_["loc"].get().strip(),
             "Tip":        vars_["tip"].get().strip(),
             "IP":         vars_["ip"].get().strip(),
+            "DRDP":       vars_["drdp"].get().strip(),
         }
+        # Validare și conversie coordonate
+        for coord_key, var_key in [("lat", "lat"), ("lng", "lng")]:
+            raw = vars_[var_key].get().strip().replace(",", ".")
+            if raw:
+                try:
+                    new_data[coord_key] = float(raw)
+                except ValueError:
+                    messagebox.showerror(
+                        "Coordonată invalidă",
+                        f"Valoarea pentru {'Latitudine' if coord_key=='lat' else 'Longitudine'} "
+                        f"nu este un număr valid: {raw!r}",
+                        parent=win)
+                    return
+            else:
+                new_data[coord_key] = None
         db = _load_contoare_db()
         if mode == "add" and ct_val in db:
             existing = db[ct_val]

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 
 from config import (
     CENTRAL_FILE_NAME, CENTRAL_FILE_FOLDER,
+    RAPOARTE_PEEK_FOLDER,
     MIN_ORE_ZI, BAND_COLORS,
 )
 from excel_report import add_charts_and_formatting
@@ -44,9 +45,14 @@ def process_peek_bin(filepath):
       6 benzi (rec_size=98, ora=[11]):
           [12:27]=B1, [27:42]=B2, [42:57]=B3, [57:72]=B4, [72:87]=B5, [87:98]=B6(11cls)
     """
-    base_name        = os.path.basename(filepath)
+    base_name = os.path.basename(filepath)
     name_without_ext = os.path.splitext(base_name)[0]
-    is_sabre         = not name_without_ext[-1].isdigit()
+
+    # Eliminăm sufixele de tipul " (Copy 2)", " (1)", " - Copy" etc.
+    # Folosim regex pentru a păstra doar partea relevantă pentru detecție
+    clean_name = re.sub(r'\s*\(.*\)$|\s*-.*$', '', name_without_ext).strip()
+
+    is_sabre = not clean_name[-1].isdigit()
 
     with open(filepath, "rb") as f:
         raw = f.read()
@@ -826,7 +832,10 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
         return None
 
     rezultate_finale = []
-    out_dir = os.path.dirname(os.path.abspath(filepaths[0]))
+    # Rapoartele se salvează întotdeauna în subfolderul central, indiferent
+    # de unde au fost selectate fișierele .bin (folder local, recursiv, etc.)
+    out_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+    os.makedirs(out_dir, exist_ok=True)
     _total_ct = len(contoare_data)
 
     for _idx_ct, (site_id, lista_dfs) in enumerate(contoare_data.items(), 1):
@@ -905,32 +914,91 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
         except Exception as _e_db:
             print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
 
-        # ── 2. Generare Excel ──────────────────────────────────────────────
-        all_band_totals = sum(df_export[c].sum() for c in band_tot_cols
-                              if c in df_export.columns)
+        # ── 2. Citire din SQLite — toată perioada acumulată pentru site_id ───
+        # Excel-ul reflectă ÎNTREAGA perioadă din DB, nu doar fișierele selectate acum.
+        df_din_db = None
+        all_source_files_db = contoare_files.get(site_id, [])  # fallback
+        try:
+            df_din_db = tdb.get_hourly_df(site_id)
+        except Exception as _e_read:
+            print(f"  [WARN] Citire DB eroare [{site_id}]: {_e_read}")
 
-        df_export.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
+        if df_din_db is not None and not df_din_db.empty:
+            df_for_excel = df_din_db.copy()
+
+            # Detectăm numărul real de benzi din N_Benzi din DB
+            n_lanes_db = n_lanes  # fallback: valoarea din parsarea curentă
+            if "N_Benzi" in df_for_excel.columns:
+                n_benzi_vals = df_for_excel["N_Benzi"].dropna()
+                if not n_benzi_vals.empty:
+                    n_lanes_db = int(n_benzi_vals.max())
+
+            # Eliminăm coloanele benzilor dincolo de n_lanes_db (artefacte schemă)
+            cols_schema_drop = []
+            for b in range(n_lanes_db + 1, 7):
+                tcol = f"Total_B{b}"
+                if tcol in df_for_excel.columns:
+                    cols_schema_drop.append(tcol)
+                for cls in list(range(1, 9)) + [15]:
+                    ccol = f"B{b}_Clasa_{cls}"
+                    if ccol in df_for_excel.columns:
+                        cols_schema_drop.append(ccol)
+            if cols_schema_drop:
+                df_for_excel = df_for_excel.drop(columns=cols_schema_drop, errors="ignore")
+
+            n_lanes = n_lanes_db
+            band_tot_cols = sorted(
+                [c for c in df_for_excel.columns
+                 if c.startswith("Total_B") and c != "Total_General"],
+                key=lambda x: int(x.replace("Total_B", ""))
+            )
+            if band_tot_cols:
+                df_for_excel["Total_General"] = df_for_excel[band_tot_cols].sum(axis=1)
+
+            # Lista completă a fișierelor sursă înregistrate în DB
+            try:
+                all_source_files_db = tdb.get_source_files(site_id) or all_source_files_db
+            except Exception:
+                pass
+        else:
+            # Fallback: folosim datele tocmai parsate (prima rulare sau DB indisponibil)
+            df_for_excel = df_export.copy()
+
+        # ── 3. Generare Excel ──────────────────────────────────────────────
+        df_export_final = df_for_excel.drop(
+            columns=["N_Benzi", "Timestamp"], errors="ignore"
+        ).reset_index(drop=True)
+
+        all_band_totals = sum(df_export_final[c].sum() for c in band_tot_cols
+                              if c in df_export_final.columns)
+
+        df_export_final.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
+
+        df_for_charts = df_for_excel.copy()
+        df_for_charts["Timestamp"] = pd.to_datetime(
+            df_for_charts["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce"
+        )
 
         if all_band_totals > 0:
-            add_charts_and_formatting(output_fn, df_export, site_id,
-                                      source_files=contoare_files.get(site_id, []),
+            add_charts_and_formatting(output_fn, df_for_charts, site_id,
+                                      source_files=all_source_files_db,
                                       source_file_periods=file_periods)
         else:
             print(f"Atenție: Contorul {site_id} are trafic zero. Excel generat fără grafice.")
 
-        suma_b1 = df_export['Total_B1'].sum() if 'Total_B1' in df_export.columns else 0
-        suma_b2 = df_export['Total_B2'].sum() if 'Total_B2' in df_export.columns else 0
+        suma_b1 = df_export_final['Total_B1'].sum() if 'Total_B1' in df_export_final.columns else 0
+        suma_b2 = df_export_final['Total_B2'].sum() if 'Total_B2' in df_export_final.columns else 0
 
         rezultate_finale.append({
-            'path': output_fn, 'id': site_id, 'randuri': len(df_export),
+            'path': output_fn, 'id': site_id, 'randuri': len(df_export_final),
             'b1': suma_b1, 'b2': suma_b2, 'n_lanes': n_lanes,
-            'source_files': contoare_files.get(site_id, []),
+            'source_files': all_source_files_db,
         })
 
         # Notifică GUI progresul după fiecare contor complet (SQLite + Excel)
         if progress_callback:
             try:
-                progress_callback(site_id, len(df_export), _idx_ct, _total_ct)
+                progress_callback(site_id, len(df_export_final), _idx_ct, _total_ct)
             except Exception:
                 pass
 

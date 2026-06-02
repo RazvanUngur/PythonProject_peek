@@ -20,7 +20,7 @@ from config import (
     VEHICLE_ANALYSIS, MIN_LUNI_AN, MIN_LUNI_AN_MAI,
     MIN_ORE_ZI, CONTOARE_HEADERS,
 )
-from contoare_db import _load_contoare_db
+from database import get_contoare_db
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PASUL 1 — această funcție trebuie să fie ÎNAINTE de update_centralizator
@@ -258,9 +258,13 @@ def update_centralizator(excel_path, site_id, central_folder):
         [c for c in ['Contor', 'An', 'Luna'] if c in df_final.columns]
     ).reset_index(drop=True)
 
-    # ── 4. Citim baza de date Contoare ÎNAINTE de a rescrie fișierul ─────────
-    # IMPORTANT: pd.ExcelWriter suprascrie fișierul, deci citim snapshot înainte!
-    db_contoare_snapshot = _load_contoare_db()
+    # ── 4. Citim baza de date Contoare din SQLite (sursa unică de adevăr) ──────
+    # contoare.db este sursa principală — nu mai depindem de snapshot-ul Excel.
+    try:
+        db_contoare_snapshot = get_contoare_db().get_all()
+    except Exception as _e_cdb:
+        print(f"[WARN] Nu am putut citi contoare.db: {_e_cdb}. Sheet 'Contoare' va fi gol.")
+        db_contoare_snapshot = {}
 
     # ── 5. Scriere Excel ──────────────────────────────────────────────────────
     with pd.ExcelWriter(CENTRAL_FILE, engine="openpyxl") as writer:
@@ -363,33 +367,48 @@ def update_centralizator(excel_path, site_id, central_folder):
         ws.freeze_panes = "A3"
 
         # ════════════════════════════════════════════════════════════════════
-        # SHEET "Contoare" — 6 coloane fixe: Contor, Drum, Poziție km,
-        #                     Localitate, Tip, IP  (gestionate din GUI)
+        # SHEET "Contoare" — 9 coloane: Contor, Drum, Poziție km, Localitate,
+        #                     Tip, IP, Lat, Lng, DRDP  (sursa: contoare.db)
         # ════════════════════════════════════════════════════════════════════
         ws_contoare = wb.create_sheet("Contoare")
         ws_contoare.sheet_view.showGridLines = False
 
-        # Folosim snapshot-ul citit ÎNAINTE de ExcelWriter (fix persistență date!)
+        # contoare.db este sursa unică de adevăr — folosim direct ce am citit din SQLite.
         db_contoare = db_contoare_snapshot
 
-        # Ne asigurăm că toate contoarele din raport sunt prezente în DB
+        # Contoare noi (apar în raport dar lipsesc din contoare.db) → upsert în SQLite
+        _cdb = None
+        try:
+            _cdb = get_contoare_db()
+        except Exception:
+            pass
         for ct in contoare_lst:
             if ct not in db_contoare:
-                db_contoare[ct] = {"Drum": "", "Pozitie_km": "",
-                                   "Localitate": "", "Tip": "", "IP": ""}
+                _empty = {"Drum": "", "Pozitie_km": "", "Localitate": "",
+                          "Tip": "", "IP": "", "lat": None, "lng": None, "DRDP": ""}
+                db_contoare[ct] = _empty
+                if _cdb is not None:
+                    try:
+                        _cdb.upsert(ct, _empty)
+                    except Exception as _eu:
+                        print(f"[WARN] Nu am putut adăuga contorul {ct} în contoare.db: {_eu}")
 
-        col_widths_ct = [16, 22, 14, 22, 26, 18]
-        for c_idx, hdr in enumerate(CONTOARE_HEADERS, 1):
+        _CT_HEADERS    = ["Contor", "Drum", "Poziție km", "Localitate", "Tip", "IP",
+                           "Lat", "Lng", "DRDP"]
+        _CT_WIDTHS     = [16, 22, 14, 22, 26, 18, 14, 14, 16]
+        for c_idx, hdr in enumerate(_CT_HEADERS, 1):
             cell = ws_contoare.cell(1, c_idx, hdr)
             cell.font      = hfont(10)
             cell.fill      = fill(C_DARK if c_idx == 1 else C_MID)
             cell.alignment = ctr()
             cell.border    = brd
-            ws_contoare.column_dimensions[get_column_letter(c_idx)].width = col_widths_ct[c_idx - 1]
+            ws_contoare.column_dimensions[get_column_letter(c_idx)].width = _CT_WIDTHS[c_idx - 1]
         ws_contoare.row_dimensions[1].height = 26
 
         for r_idx, (ct_id, data) in enumerate(sorted(db_contoare.items()), 2):
             row_fill = fill(paleta[(r_idx - 2) % len(paleta)])
+            lat_val = data.get("lat") or data.get("Lat")
+            lng_val = data.get("lng") or data.get("Lng")
             values = [
                 ct_id,
                 data.get("Drum", ""),
@@ -397,6 +416,9 @@ def update_centralizator(excel_path, site_id, central_folder):
                 data.get("Localitate", ""),
                 data.get("Tip", ""),
                 data.get("IP", ""),
+                round(float(lat_val), 6) if lat_val not in (None, "") else "",
+                round(float(lng_val), 6) if lng_val not in (None, "") else "",
+                data.get("DRDP", ""),
             ]
             for c_idx, val in enumerate(values, 1):
                 cell = ws_contoare.cell(r_idx, c_idx, val)

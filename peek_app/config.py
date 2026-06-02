@@ -6,6 +6,10 @@
 CENTRAL_FILE_NAME   = "0_Centralizator_PEEK-VEK.xlsx"
 CENTRAL_FILE_FOLDER = r"L:\BIDMRCT\datePEEK"
 
+# ── Subfoldere în CENTRAL_FILE_FOLDER ─────────────────────────────────────────
+RAPOARTE_PEEK_FOLDER = "0_Rapoarte_PEEK-VEK"   # rapoarte Excel per post
+SQLITE_FOLDER        = "SQLite"                  # baze de date trafic.db / contoare.db
+
 # ── Mapare categorii vehicule → clase PEEK ────────────────────────────────────
 VEHICLE_ANALYSIS = {
     "Autoturisme": ["Clasa_2"],
@@ -61,12 +65,9 @@ _BTN_COLORS = {
 CONTOARE_COLS_ORDER = ["Drum", "Pozitie_km", "Localitate", "Tip", "IP"]
 CONTOARE_HEADERS    = ["Contor", "Drum", "Poziție km", "Localitate", "Tip", "IP"]
 TIP_OPTIONS = [
-    "ADR 2000 - Clasificator",
-    "ADR 2000 - WIM",
-    "ADR 3000 - Clasificator",
-    "ADR 3000 - WIM",
-    "ADR Sabre - Clasificator",
-    "ADR Sabre - WIM",
+    "ADR 2000",
+    "ADR 3000",
+    "ADR Sabre",
     "VEKs4",
 ]
 

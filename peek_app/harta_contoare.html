@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Hartă Contoare — CESTRIN</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f1f5f9;
+           display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+    /* ── HEADER ── */
+    #header {
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+      padding: 10px 18px; display: flex; align-items: center; gap: 14px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.3); flex-shrink: 0; flex-wrap: wrap;
+    }
+    #header-logo {
+      width: 34px; height: 34px; border-radius: 8px; font-size: 18px;
+      background: linear-gradient(135deg,#3b82f6,#1d4ed8);
+      display: flex; align-items: center; justify-content: center;
+    }
+    #header-title { color:#fff; font-weight:700; font-size:15px; letter-spacing:-.3px; }
+    #header-sub   { color:#94a3b8; font-size:11px; }
+    #header-spacer { flex:1; }
+    .pill {
+      padding: 4px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 600;
+      border: 1px solid rgba(255,255,255,.12); cursor: pointer;
+      transition: all .15s; white-space: nowrap;
+    }
+    .pill.active { border-width: 1.5px; }
+    #btn-refresh, #btn-source {
+      background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2);
+      color: #fff; border-radius: 7px; padding: 5px 12px; cursor: pointer;
+      font-size: 12px; font-weight: 600;
+    }
+    #btn-source.demo { background:rgba(245,158,11,.15); border-color:#d97706; color:#fbbf24; }
+
+    /* ── BANNER ── */
+    .banner { padding: 7px 18px; font-size: 12.5px; flex-shrink: 0;
+              display: flex; align-items: center; gap: 8px; }
+    .banner.warn  { background:#fef3c7; border-bottom:1px solid #fcd34d; color:#92400e; }
+    .banner.ok    { background:#f0fdf4; border-bottom:1px solid #bbf7d0; color:#166534; }
+    .banner.info  { background:#eff6ff; border-bottom:1px solid #bfdbfe; color:#1d4ed8; }
+    .banner-close { margin-left:auto; cursor:pointer; font-weight:700; }
+
+    /* ── CORP ── */
+    #body { flex:1; display:flex; overflow:hidden; }
+
+    /* ── SIDEBAR ── */
+    #sidebar {
+      width: 272px; background: #fff; border-right: 1px solid #e2e8f0;
+      display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
+    }
+    #filters { padding: 11px 12px; border-bottom: 1px solid #f1f5f9; }
+    #search {
+      width:100%; padding:6px 10px; border:1.5px solid #e2e8f0; border-radius:7px;
+      font-size:12px; outline:none; background:#f8fafc;
+    }
+    .filter-row { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
+    .fbtn {
+      padding: 3px 8px; border-radius: 11px; font-size: 10.5px; font-weight: 600;
+      cursor: pointer; border-width: 1.5px; border-style: solid; transition: all .15s;
+      background: transparent;
+    }
+    .fbtn.active { color: #fff !important; }
+    #count-label { margin-top:6px; font-size:11px; color:#94a3b8; }
+
+    #list { flex:1; overflow-y:auto; }
+    .list-item {
+      padding: 9px 12px; border-bottom: 1px solid #f8fafc; cursor: pointer;
+      border-left: 3px solid transparent; transition: background .1s;
+    }
+    .list-item:hover { background: #f8fafc; }
+    .list-item.sel   { background: #eff6ff; border-left-color: #3b82f6; }
+    .list-item-top   { display:flex; align-items:center; gap:7px; margin-bottom:2px; }
+    .list-dot        { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .list-name       { font-weight:700; font-size:12.5px; color:#0f172a; }
+    .list-tip        { margin-left:auto; font-size:9.5px; font-weight:600; color:#64748b;
+                       background:#f1f5f9; padding:1px 5px; border-radius:7px; }
+    .list-sub        { font-size:11px; color:#475569; padding-left:15px; }
+    .list-mzl        { font-size:11px; font-weight:600; padding-left:15px; margin-top:1px; }
+    .badge-m         { font-size:9.5px; background:#dbeafe; color:#1d4ed8;
+                       padding:1px 5px; border-radius:7px; margin-left:4px; font-weight:600; }
+    .list-noloc      { font-size:10px; color:#7c3aed; padding-left:15px; margin-top:1px; }
+
+    #legend { padding:9px 12px; border-top:1px solid #e2e8f0; background:#fafafa; }
+    .leg-title { font-size:10px; font-weight:700; color:#64748b;
+                 margin-bottom:5px; letter-spacing:.5px; }
+    .leg-row   { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
+    .leg-dot   { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .leg-lbl   { font-size:11px; color:#475569; }
+    #leg-note  { margin-top:5px; font-size:10px; color:#94a3b8; line-height:1.4; }
+
+    /* ── HARTĂ ── */
+    #map-wrap { flex:1; position:relative; }
+    #map      { width:100%; height:100%; }
+    #noloc-badge {
+      position:absolute; top:12px; left:12px; z-index:1000;
+      background:rgba(124,58,237,.12); backdrop-filter:blur(8px);
+      border:1px solid #7c3aed; border-radius:8px;
+      padding:6px 12px; font-size:11.5px; color:#7c3aed; font-weight:600;
+      display:none;
+    }
+    #loading-overlay {
+      position:absolute; inset:0; display:flex; align-items:center;
+      justify-content:center; background:#f1f5f9; z-index:999;
+      font-size:14px; color:#64748b;
+    }
+
+    /* ── Popup Leaflet ── */
+    .cestrin-popup .leaflet-popup-content-wrapper {
+      border-radius:10px!important; box-shadow:0 8px 32px rgba(0,0,0,.16)!important;
+      padding:0!important; border:1px solid #e2e8f0;
+    }
+    .cestrin-popup .leaflet-popup-content { margin:14px 16px!important; }
+    .cestrin-popup .leaflet-popup-tip     { background:white!important; }
+
+    .popup-header { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+    .popup-dot    { width:11px; height:11px; border-radius:50%; flex-shrink:0; }
+    .popup-name   { font-weight:700; font-size:15px; color:#0f172a; letter-spacing:-.3px; }
+    .popup-table  { width:100%; border-collapse:collapse; font-size:12.5px; }
+    .popup-table td { padding:3px 0; }
+    .popup-table td:first-child { color:#64748b; width:115px; }
+    .popup-table td:last-child  { font-weight:600; color:#1e293b; }
+    .popup-hr     { border:none; border-top:1px solid #e2e8f0; margin:6px 0; }
+    .popup-status { margin-top:9px; padding:5px 10px; border-radius:6px;
+                    display:inline-flex; align-items:center; gap:6px; }
+    .popup-status-dot { width:8px; height:8px; border-radius:50%; }
+    .popup-status-lbl { font-size:11.5px; font-weight:600; }
+    .popup-noloc-hint { margin-top:6px; font-size:11px; color:#7c3aed; }
+
+    .drag-confirm { font-family:'Segoe UI',system-ui,sans-serif; padding:4px; }
+    .drag-confirm h4 { font-weight:700; margin-bottom:8px; color:#0f172a; }
+    .drag-confirm p  { font-size:12px; color:#64748b; margin-bottom:10px; }
+    .btn-save-coord  {
+      background:#16a34a; color:white; border:none; padding:6px 14px;
+      border-radius:6px; cursor:pointer; font-weight:600; font-size:12px; width:100%;
+    }
+    .btn-save-coord:hover { background:#15803d; }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div id="header">
+  <div id="header-logo">🗺️</div>
+  <div>
+    <div id="header-title">Hartă Contoare Trafic</div>
+    <div id="header-sub">CESTRIN · Serviciul Studii de Trafic · Referință: <span id="luna-ref-lbl">—</span></div>
+  </div>
+  <div id="header-spacer"></div>
+  <div id="stat-pills"></div>
+  <button id="btn-refresh" onclick="loadData()">↺ Actualizează</button>
+</div>
+
+<!-- BANNERE -->
+<div id="banner-warn"  class="banner warn"  style="display:none">
+  <span id="banner-warn-txt"></span>
+  <span class="banner-close" onclick="this.parentElement.style.display='none'">✕</span>
+</div>
+<div id="banner-ok"   class="banner ok"   style="display:none">
+  <span id="banner-ok-txt"></span>
+</div>
+<div id="banner-info" class="banner info" style="display:none">
+  <span id="banner-info-txt"></span>
+</div>
+
+<!-- CORP -->
+<div id="body">
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+    <div id="filters">
+      <input id="search" placeholder="Caută contor, drum, localitate..."
+             oninput="renderList()"/>
+      <div class="filter-row" id="status-filters"></div>
+      <div class="filter-row" id="tip-filters"></div>
+      <div class="filter-row" id="drdp-filters"></div>
+      <div id="count-label">—</div>
+    </div>
+    <div id="list"></div>
+    <div id="legend">
+      <div class="leg-title">LEGENDĂ</div>
+      <div id="leg-rows"></div>
+      <div id="leg-note">
+        Clasa 15 ≥ 10% → Totalizator<br/>
+        Contoare fără coordonate: trage markerul ⊕ pe poziție
+      </div>
+    </div>
+  </div>
+
+  <!-- HARTĂ -->
+  <div id="map-wrap">
+    <div id="map"></div>
+    <div id="noloc-badge"></div>
+    <div id="loading-overlay">Se încarcă harta...</div>
+  </div>
+
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG STATUS
+// ═══════════════════════════════════════════════════════════════════════════
+const STATUS_CFG = {
+  CLASIFICATOR: { label:"Clasificator",    fill:"#22c55e", ring:"#15803d", color:"#14532d" },
+  TOTALIZATOR:  { label:"Totalizator",     fill:"#f59e0b", ring:"#d97706", color:"#78350f" },
+  FARA_COM:     { label:"Fără comunicare", fill:"#a78bfa", ring:"#6d28d9", color:"#4c1d95" },
+  DEFECT:       { label:"Defect",          fill:"#ef4444", ring:"#dc2626", color:"#7f1d1d" },
+  NELOCALIZAT:  { label:"Nelocalizat",     fill:"#9ca3af", ring:"#6b7280", color:"#374151" },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════
+let contoare    = [];
+let markers     = {};        // { contor: L.Marker }
+let selectedId  = null;
+let filterSt    = "ALL";
+let filterTip   = "ALL";
+let filterDrdp  = "ALL";
+let map         = null;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HARTĂ
+// ═══════════════════════════════════════════════════════════════════════════
+function initMap() {
+  map = L.map("map", { center:[45.9432,24.9668], zoom:7, zoomControl:false });
+  L.control.zoom({ position:"bottomright" }).addTo(map);
+  L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    { attribution:"© OpenStreetMap © CARTO", maxZoom:19 }
+  ).addTo(map);
+  document.getElementById("loading-overlay").style.display = "none";
+}
+
+// ── SVG icon ───────────────────────────────────────────────────────────────
+function makeIcon(status, opts={}) {
+  const { selected=false, draggable=false } = opts;
+  const s   = STATUS_CFG[status] || STATUS_CFG.NELOCALIZAT;
+  const r   = selected ? 13 : 10;
+  const ring= selected ? 3.5 : 2;
+  const tot = (r+ring)*2, cx = tot/2;
+  let inner = "";
+  if (draggable) {
+    inner = `<circle cx="${cx}" cy="${cx}" r="${r*.38}" fill="white" fill-opacity=".9"/>
+             <line x1="${cx}" y1="${cx-r*.55}" x2="${cx}" y2="${cx+r*.55}"
+                   stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+             <line x1="${cx-r*.55}" y1="${cx}" x2="${cx+r*.55}" y2="${cx}"
+                   stroke="white" stroke-width="1.5" stroke-linecap="round"/>`;
+  } else if (selected) {
+    inner = `<circle cx="${cx}" cy="${cx}" r="${r*.38}" fill="white" fill-opacity=".9"/>`;
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${tot}" height="${tot}">
+    <circle cx="${cx}" cy="${cx}" r="${r}" fill="${s.fill}"
+            stroke="${s.ring}" stroke-width="${ring}" fill-opacity="${selected?1:.9}"/>
+    ${inner}
+  </svg>`;
+  return L.divIcon({
+    html: svg, className:"",
+    iconSize:[tot,tot], iconAnchor:[cx,cx], popupAnchor:[0,-(cx+4)]
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POPUP HTML
+// ═══════════════════════════════════════════════════════════════════════════
+function fmt(v) {
+  return v == null ? "—" : Number(v).toLocaleString("ro-RO");
+}
+
+function buildPopup(c) {
+  const s = STATUS_CFG[c.status] || STATUS_CFG.NELOCALIZAT;
+  const mzlStr = c.mzl != null ? fmt(c.mzl)+" veh/zi" : "Indisponibil";
+  const manualBadge = c.mzl_sursa==="manual"
+    ? `<span style="font-size:10px;background:#dbeafe;color:#1d4ed8;
+                    padding:1px 6px;border-radius:8px;font-weight:600;margin-left:5px">manual</span>`
+    : c.mzl_sursa==="calculat"
+    ? `<span style="font-size:10px;background:#f1f5f9;color:#64748b;
+                    padding:1px 6px;border-radius:8px;font-weight:600;margin-left:5px">estimat</span>`
+    : "";
+  const pct15 = (c.total_cls15!=null && c.total_veh)
+    ? `${fmt(c.total_cls15)} (${Math.round(c.total_cls15/c.total_veh*100)}%)`
+    : "—";
+  const ultimaRow = (c.ultima_luna && c.status!=="CLASIFICATOR" && c.status!=="TOTALIZATOR")
+    ? `<tr><td>Ultimele date</td><td style="color:#475569">${c.ultima_luna}</td></tr>` : "";
+  const nolocHint = c.status==="NELOCALIZAT"
+    ? `<div class="popup-noloc-hint">📍 Trage markerul pe poziția corectă pentru a salva coordonatele.</div>`
+    : "";
+
+  return `
+    <div>
+      <div class="popup-header">
+        <span class="popup-dot" style="background:${s.fill}"></span>
+        <span class="popup-name">${c.contor}</span>
+      </div>
+      <table class="popup-table">
+        <tr><td>Drum</td>       <td>${c.drum||"—"}</td></tr>
+        <tr><td>Poziție km</td> <td>${c.pozitie_km||"—"}</td></tr>
+        <tr><td>Localitate</td> <td>${c.localitate||"—"}</td></tr>
+        <tr><td>Tip contor</td> <td>${c.tip||"—"}</td></tr>
+        ${c.drdp ? `<tr><td>DRDP</td><td>${c.drdp}</td></tr>` : ""}
+        <tr><td colspan="2"><hr class="popup-hr"/></td></tr>
+        <tr><td>MZL ${c.luna_ref||""}</td>
+            <td style="font-weight:700;color:${s.fill};font-size:13.5px">
+              ${mzlStr}${manualBadge}</td></tr>
+        <tr><td>Clasa 15</td>  <td style="color:#475569">${pct15}</td></tr>
+        <tr><td>Acoperire ore</td><td style="color:#475569">${c.acop_pct!=null?c.acop_pct+"%":"—"}</td></tr>
+        ${ultimaRow}
+      </table>
+      <div class="popup-status"
+           style="background:${s.fill}18;border:1px solid ${s.ring}">
+        <span class="popup-status-dot" style="background:${s.fill}"></span>
+        <span class="popup-status-lbl" style="color:${s.color}">${s.label}</span>
+      </div>
+      ${nolocHint}
+    </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKERE
+// ═══════════════════════════════════════════════════════════════════════════
+function rebuildMarkers() {
+  // Curăță
+  Object.values(markers).forEach(m => m.remove());
+  markers = {};
+
+  const filtered = getFiltered();
+
+  // Contoare cu coordonate
+  filtered.filter(c => c.lat && c.lng).forEach(c => {
+    const isSel = selectedId === c.contor;
+    const m = L.marker([c.lat, c.lng], {
+      icon: makeIcon(c.status, { selected: isSel }),
+      zIndexOffset: isSel ? 1000 : 0,
+      title: c.contor,
+    });
+    m.bindPopup(buildPopup(c), { maxWidth:360, className:"cestrin-popup" });
+    m.on("click", () => { selectedId = c.contor; renderList(); });
+    m.on("popupclose", () => { selectedId = null; renderList(); });
+    m.addTo(map);
+    markers[c.contor] = m;
+  });
+
+  // Contoare fără coordonate — draggable, plasate central
+  const unlocated = filtered.filter(c => !c.lat || !c.lng);
+  unlocated.forEach((c, i) => {
+    const lat = 45.9432 + (i - unlocated.length/2) * 0.35;
+    const m = L.marker([lat, 24.9668], {
+      icon: makeIcon("NELOCALIZAT", { draggable:true }),
+      draggable: true,
+      title: `${c.contor} — trage pe poziția corectă`,
+      zIndexOffset: 500,
+    });
+    m.bindPopup(buildPopup(c), { maxWidth:360, className:"cestrin-popup" });
+    m.on("click", () => { selectedId = c.contor; renderList(); m.openPopup(); });
+
+    m.on("dragend", (e) => {
+      const { lat: nLat, lng: nLng } = e.target.getLatLng();
+      const safeId = c.contor.replace(/[^a-z0-9]/gi,"_");
+      const html = `
+        <div class="drag-confirm">
+          <h4>${c.contor}</h4>
+          <p>Lat: <b>${nLat.toFixed(5)}</b><br/>Lng: <b>${nLng.toFixed(5)}</b></p>
+          <button class="btn-save-coord" id="bsc_${safeId}">✓ Salvează coordonatele</button>
+        </div>`;
+      m.bindPopup(html, { maxWidth:230, className:"cestrin-popup" }).openPopup();
+      setTimeout(() => {
+        const btn = document.getElementById(`bsc_${safeId}`);
+        if (btn) btn.onclick = () => {
+          m.closePopup();
+          saveCoords(c.contor, nLat, nLng);
+        };
+      }, 120);
+    });
+
+    m.addTo(map);
+    markers[c.contor] = m;
+  });
+
+  // Badge nelocalizate
+  const nolocBadge = document.getElementById("noloc-badge");
+  const nNoloc = contoare.filter(c => !c.lat || !c.lng).length;
+  if (nNoloc > 0) {
+    nolocBadge.textContent = `${nNoloc} contor(e) nelocalizate — trage markerul ⊕ pe poziție`;
+    nolocBadge.style.display = "block";
+  } else {
+    nolocBadge.style.display = "none";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SALVARE COORDONATE
+// ═══════════════════════════════════════════════════════════════════════════
+async function saveCoords(contor, lat, lng) {
+  showBanner("info", `Se salvează coordonatele pentru ${contor}...`);
+  try {
+    const res = await fetch("/api/harta_contoare/coordonate", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ contor, lat, lng }),
+    });
+    const json = await res.json();
+    if (!res.ok || json.error) throw new Error(json.error||"Eroare server");
+    hideBanner("info");
+    showBanner("ok", `✓ Coordonate salvate pentru ${contor}`);
+    setTimeout(() => hideBanner("ok"), 3000);
+    await loadData();
+  } catch(e) {
+    hideBanner("info");
+    showBanner("warn", `Eroare salvare coordonate: ${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOAD DATE
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadData() {
+  try {
+    const res  = await fetch("/api/harta_contoare");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    contoare = json;
+    hideBanner("warn");
+  } catch(e) {
+    showBanner("warn", `Eroare la încărcarea datelor: ${e.message}`);
+    return;
+  }
+
+  // Luna referință
+  const lr = contoare.find(c => c.luna_ref);
+  document.getElementById("luna-ref-lbl").textContent = lr?.luna_ref || "—";
+
+  // Stat pills în header
+  renderStatPills();
+
+  // Filtre sidebar
+  renderFilters();
+
+  // Lista + markere
+  renderList();
+  rebuildMarkers();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILTRE
+// ═══════════════════════════════════════════════════════════════════════════
+function getFiltered() {
+  const q = document.getElementById("search").value.toLowerCase();
+  return contoare.filter(c => {
+    if (filterSt   !== "ALL" && c.status !== filterSt)   return false;
+    if (filterTip  !== "ALL" && c.tip    !== filterTip)   return false;
+    if (filterDrdp !== "ALL" && (c.drdp||"") !== filterDrdp) return false;
+    if (q) return [c.contor,c.drum,c.localitate,c.pozitie_km]
+      .some(v => v && v.toLowerCase().includes(q));
+    return true;
+  });
+}
+
+function renderFilters() {
+  // Status — Mod de funcționare
+  const sf = document.getElementById("status-filters");
+  sf.innerHTML = `<div style="width:100%;font-size:10px;font-weight:700;color:#64748b;
+    letter-spacing:.4px;margin-bottom:1px">MOD DE FUNCȚIONARE</div>`;
+  const allBtn = mkFBtn("Toate", () => { filterSt="ALL"; renderAll(); },
+                        "#64748b", "#cbd5e1", filterSt==="ALL");
+  sf.appendChild(allBtn);
+  Object.entries(STATUS_CFG).forEach(([k,v]) => {
+    sf.appendChild(mkFBtn(v.label, () => {
+      filterSt = filterSt===k ? "ALL" : k; renderAll();
+    }, v.color, v.ring, filterSt===k, v.fill));
+  });
+
+  // Tipuri — Echipament
+  const tipuri = [...new Set(contoare.map(c=>c.tip).filter(Boolean))].sort();
+  const tf = document.getElementById("tip-filters");
+  tf.innerHTML = "";
+  if (tipuri.length > 1) {
+    tf.innerHTML = `<div style="width:100%;font-size:10px;font-weight:700;color:#64748b;
+      letter-spacing:.4px;margin-bottom:1px;margin-top:2px">ECHIPAMENT</div>`;
+    tf.appendChild(mkFBtn("Toate", () => { filterTip="ALL"; renderAll(); },
+                          "#1d4ed8","#93c5fd", filterTip==="ALL"));
+    tipuri.forEach(t => tf.appendChild(mkFBtn(t, () => {
+      filterTip = filterTip===t?"ALL":t; renderAll();
+    }, "#1d4ed8","#93c5fd", filterTip===t)));
+  }
+
+  // DRDP
+  const drdpuri = [...new Set(contoare.map(c=>c.drdp||"").filter(Boolean))].sort();
+  const df = document.getElementById("drdp-filters");
+  df.innerHTML = "";
+  if (drdpuri.length > 1) {
+    df.innerHTML = `<div style="width:100%;font-size:10px;font-weight:700;color:#64748b;
+      letter-spacing:.4px;margin-bottom:1px;margin-top:2px">DRDP</div>`;
+    const allDrdpBtn = mkFBtn("Toate", () => { filterDrdp="ALL"; renderAll(); },
+                              "#0891b2","#67e8f9", filterDrdp==="ALL");
+    df.appendChild(allDrdpBtn);
+    drdpuri.forEach(d => df.appendChild(mkFBtn(d, () => {
+      filterDrdp = filterDrdp===d?"ALL":d; renderAll();
+    }, "#0891b2","#67e8f9", filterDrdp===d)));
+  }
+
+  // Legendă
+  const lr = document.getElementById("leg-rows");
+  lr.innerHTML = "";
+  Object.entries(STATUS_CFG).forEach(([,v]) => {
+    lr.innerHTML += `<div class="leg-row">
+      <span class="leg-dot" style="background:${v.fill}"></span>
+      <span class="leg-lbl">${v.label}</span>
+    </div>`;
+  });
+}
+
+function mkFBtn(label, fn, color, border, active, fill) {
+  const b = document.createElement("button");
+  b.className = "fbtn" + (active?" active":"");
+  b.textContent = label;
+  b.style.color  = active ? "#fff" : color;
+  b.style.borderColor = border;
+  if (active && fill) b.style.background = fill;
+  else if (active)    b.style.background = color;
+  b.onclick = fn;
+  return b;
+}
+
+function renderStatPills() {
+  const el = document.getElementById("stat-pills");
+  el.innerHTML = "";
+  el.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;";
+  Object.entries(STATUS_CFG).forEach(([k,v]) => {
+    const n = contoare.filter(c => c.status===k).length;
+    if (!n) return;
+    const p = document.createElement("div");
+    p.className = "pill" + (filterSt===k?" active":"");
+    p.textContent = `${n} ${v.label}`;
+    p.style.cssText = `background:${filterSt===k?v.fill+"33":"rgba(255,255,255,.07)"};
+      color:${v.fill};border-color:${filterSt===k?v.ring:"rgba(255,255,255,.12)"};`;
+    p.onclick = () => { filterSt = filterSt===k?"ALL":k; renderAll(); };
+    el.appendChild(p);
+  });
+}
+
+function renderAll() {
+  renderStatPills();
+  renderFilters();
+  renderList();
+  rebuildMarkers();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LISTA SIDEBAR
+// ═══════════════════════════════════════════════════════════════════════════
+function renderList() {
+  const filtered = getFiltered();
+  document.getElementById("count-label").textContent =
+    `${filtered.length} din ${contoare.length} contoare`;
+
+  const el = document.getElementById("list");
+  if (!filtered.length) {
+    el.innerHTML = `<div style="padding:18px;text-align:center;color:#94a3b8;font-size:13px">
+      Niciun contor corespunde filtrelor.</div>`;
+    return;
+  }
+
+  el.innerHTML = filtered.map(c => {
+    const s    = STATUS_CFG[c.status] || STATUS_CFG.NELOCALIZAT;
+    const isSel= selectedId===c.contor;
+    const mzlStr = c.mzl!=null ? fmt(c.mzl)+" veh/zi" : "—";
+    const manualBadge = c.mzl_sursa==="manual"
+      ? `<span class="badge-m">M</span>`
+      : c.mzl_sursa==="calculat"
+      ? `<span class="badge-m" style="background:#f1f5f9;color:#64748b">~</span>`
+      : "";
+    const lunaSpan = c.luna_ref
+      ? `<span style="color:#94a3b8;font-weight:400"> · ${c.luna_ref}</span>` : "";
+    const nolocDiv = !c.lat
+      ? `<div class="list-noloc">📍 Trage markerul din centrul hărții</div>` : "";
+    return `
+      <div class="list-item${isSel?" sel":""}"
+           onclick="focusContor('${c.contor}')"
+           style="cursor:${c.lat?'pointer':'default'}">
+        <div class="list-item-top">
+          <span class="list-dot"
+                style="background:${s.fill};box-shadow:0 0 4px ${s.fill}99"></span>
+          <span class="list-name">${c.contor}</span>
+          <span class="list-tip">${c.tip||"—"}</span>
+          ${c.drdp ? `<span style="font-size:9px;font-weight:600;color:#0891b2;
+            background:#ecfeff;padding:1px 5px;border-radius:6px;margin-left:2px">${c.drdp}</span>` : ""}
+        </div>
+        <div class="list-sub">${c.drum||""} · ${c.pozitie_km||"km?"} · ${c.localitate||"—"}</div>
+        <div class="list-mzl" style="color:${s.fill}">
+          MZL: ${mzlStr}${manualBadge}${lunaSpan}
+        </div>
+        ${nolocDiv}
+      </div>`;
+  }).join("");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FOCUS
+// ═══════════════════════════════════════════════════════════════════════════
+function focusContor(contor) {
+  const c = contoare.find(x => x.contor===contor);
+  if (!c || !c.lat || !c.lng) return;
+  map.setView([c.lat, c.lng], 12, { animate:true, duration:.6 });
+  const m = markers[contor];
+  if (m) { m.openPopup(); selectedId = contor; renderList(); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BANNERE
+// ═══════════════════════════════════════════════════════════════════════════
+function showBanner(type, msg) {
+  const el  = document.getElementById(`banner-${type}`);
+  const txt = document.getElementById(`banner-${type}-txt`);
+  if (txt) txt.textContent = msg;
+  if (el)  el.style.display = "flex";
+}
+function hideBanner(type) {
+  const el = document.getElementById(`banner-${type}`);
+  if (el) el.style.display = "none";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════════════
+document.addEventListener("DOMContentLoaded", () => {
+  initMap();
+  loadData();
+});
+</script>
+</body>
+</html>

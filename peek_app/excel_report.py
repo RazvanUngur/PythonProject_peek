@@ -925,9 +925,18 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
             totaluri_zilnice = []  # păstrat pentru compatibilitate — neutilizat după refactorizare
 
-            sume_clase = {f'Clasa_{i}': 0 for i in range(1, 9)}
-            sume_clase['Clasa_15'] = 0
-            n_zile_cls = 0  # număr zile care au contribuit la sume_clase
+            # Acumulare cu două seturi paralele:
+            #   - sume_total / sume_cls_all: toate zilele valide (C + T)
+            #     → MZL Total și medii de bază cls 1-8
+            #   - sume_cls_c: doar zilele clasificator
+            #     → proporții reale cls 1-8 (fără cls15 în numitor)
+            sume_total = 0
+            sume_cls_all = {f'Clasa_{i}': 0 for i in range(1, 9)}
+            sume_cls_all['Clasa_15'] = 0
+            n_zile_total = 0
+
+            sume_cls_c = {f'Clasa_{i}': 0 for i in range(1, 9)}
+            n_zile_c = 0
 
             for _zi_d in zile_valide_luna:
 
@@ -941,10 +950,6 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 if _tip == 'null':
                     continue
 
-                # TOTAL ȘI CLASE DIN DATE PRELUCRATE (post-reconstrucție benzi)
-                # Se folosesc valorile din _dp_ocls_map — consistente între ele.
-                # Benzile T fără pereche utilizabilă au totalul pus în Clasa_15,
-                # deci suma(clase) == total_zi întotdeauna.
                 _dp_zi = _dp_ocls_map.get(_zi_d, {})
                 _ocls_zi = _dp_zi.get('cls', {})
                 _otot_zi = _dp_zi.get('tot', {})
@@ -954,33 +959,74 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 if total_zi == 0:
                     continue
 
-                n_zile_cls += 1
-                for _cls_i in list(range(1, 9)) + [15]:
-                    val_cls = 0
-                    for _b in band_ids:
-                        val_cls += _ocls_zi.get(_b, {}).get(_cls_i, 0)
-                    sume_clase[f'Clasa_{_cls_i}'] += val_cls
+                sume_total += total_zi
+                n_zile_total += 1
 
-            n_zile_dp = n_zile_cls  # contor unic — clase și total din același set de zile
+                for _cls_i in list(range(1, 9)) + [15]:
+                    _val = sum(_ocls_zi.get(_b, {}).get(_cls_i, 0) for _b in band_ids)
+                    sume_cls_all[f'Clasa_{_cls_i}'] += _val
+
+                if _tip == 'clasificator':
+                    n_zile_c += 1
+                    for _cls_i in range(1, 9):
+                        _val = sum(_ocls_zi.get(_b, {}).get(_cls_i, 0) for _b in band_ids)
+                        sume_cls_c[f'Clasa_{_cls_i}'] += _val
+
+            n_zile_dp = n_zile_total
 
             if n_zile_dp > 0:
 
                 medii = {}
 
-                for i in range(1, 9):
-                    medii[f'Clasa_{i}'] = round(
-                        sume_clase[f'Clasa_{i}'] / n_zile_dp
-                    )
+                # MZL Total = media totalurilor din toate zilele valide (C + T)
+                mzl_total = round(sume_total / n_zile_total)
 
-                medii['Clasa_15'] = round(
-                    sume_clase['Clasa_15'] / n_zile_dp
-                )
+                # Medii de bază cls 1-8 și cls15 din toate zilele
+                medii_all = {
+                    f'Clasa_{i}': round(sume_cls_all[f'Clasa_{i}'] / n_zile_total)
+                    for i in list(range(1, 9)) + [15]
+                }
+                cls15_de_redistribuit = medii_all['Clasa_15']
 
-                # Total = suma mediilor pe clase — garantat consistent
-                # deoarece fiecare zi are suma(clase) == total_zi
-                medii['Total'] = sum(
-                    medii[f'Clasa_{i}'] for i in range(1, 9)
-                ) + medii['Clasa_15']
+                if n_zile_c > 0:
+                    # Proporții din zilele clasificator, numitor = total cls 1-8 fără cls15
+                    # Astfel cls15 se redistribuie proporțional cu structura reală a traficului
+                    total_c_fara15 = sum(sume_cls_c[f'Clasa_{i}'] for i in range(1, 9))
+
+                    if total_c_fara15 > 0:
+                        prop = {
+                            i: sume_cls_c[f'Clasa_{i}'] / total_c_fara15
+                            for i in range(1, 9)
+                        }
+
+                        # Fiecare clasă = media sa (din toate zilele) + proporție × cls15
+                        # Clasa dominantă (sortată descrescător) absoarbe restul de rotunjire
+                        # garantând suma cls 1-8 == mzl_total exact
+                        cls_sortate = sorted(range(1, 9), key=lambda i: prop[i], reverse=True)
+                        atribuit = 0
+                        for idx, i in enumerate(cls_sortate):
+                            if idx == len(cls_sortate) - 1:
+                                medii[f'Clasa_{i}'] = max(0, mzl_total - atribuit)
+                            else:
+                                v = medii_all[f'Clasa_{i}'] + round(prop[i] * cls15_de_redistribuit)
+                                medii[f'Clasa_{i}'] = v
+                                atribuit += v
+                    else:
+                        # Zilele C au toate clasele 0 — fallback uniform
+                        per_cls = mzl_total // 8
+                        rest = mzl_total - per_cls * 8
+                        for i in range(1, 9):
+                            medii[f'Clasa_{i}'] = per_cls + (rest if i == 1 else 0)
+                else:
+                    # Nicio zi clasificator — cls 1-8 nedeterminabile
+                    for i in range(1, 9):
+                        medii[f'Clasa_{i}'] = 0
+
+                # Clasa_15 = 0 (redistribuită complet în cls 1-8)
+                medii['Clasa_15'] = 0
+
+                # Total garantat consistent
+                medii['Total'] = mzl_total
 
             else:
 

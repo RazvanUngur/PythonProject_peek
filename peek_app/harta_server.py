@@ -40,8 +40,10 @@ log.setLevel(logging.ERROR)
 HARTA_PORT = 5757
 HARTA_URL  = f"http://127.0.0.1:{HARTA_PORT}"
 
-# ── Folder unde e harta_contoare.html (lângă acest fișier) ───────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# ── Folder unde e harta_contoare.html ────────────────────────────────────────
+# În executabilul PyInstaller fișierele din datas sunt extrase în sys._MEIPASS
+import sys as _sys
+_HERE = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
 
 class HartaServer:
@@ -60,13 +62,6 @@ class HartaServer:
 
         @flask_app.route("/")
         def index():
-            import os
-
-            html_path = os.path.join(_HERE, "harta_contoare.html")
-
-            if not os.path.exists(html_path):
-                return f"Nu gasesc: {html_path}", 500
-
             return send_from_directory(_HERE, "harta_contoare.html")
 
         @flask_app.route("/api/harta_contoare", methods=["GET"])

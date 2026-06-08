@@ -27,7 +27,7 @@ def _luna_referinta() -> tuple:
       - înainte sau pe ziua 10       → luna curentă - 2
     """
     azi = datetime.now()
-    decalaj = 2 if azi.day > 10 else 3
+    decalaj = 1 if azi.day > 10 else 2
     luna = azi.month - decalaj
     an   = azi.year
     while luna <= 0:

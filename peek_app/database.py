@@ -244,6 +244,30 @@ class TrafficDB:
         conn.executescript(_TRAFFIC_SCHEMA)
         conn.commit()
 
+    @staticmethod
+    def _resolve_contor_alias(site_id: str) -> str:
+        """
+        Verifică dacă postul site_id a fost redenumit (există în contor_alias).
+        Dacă da, returnează codul nou; altfel returnează site_id nemodificat.
+        Astfel, dacă se reprocesează fișiere vechi cu codul 8203, datele
+        vor fi salvate automat sub codul nou 1203.
+        """
+        try:
+            conn = sqlite3.connect(CONTOARE_DB, timeout=10)
+            try:
+                row = conn.execute(
+                    "SELECT cod_nou FROM contor_alias WHERE cod_vechi = ?",
+                    (site_id,)
+                ).fetchone()
+                if row:
+                    print(f"  [ALIAS] {site_id} → {row[0]} (redenumit)")
+                    return row[0]
+            finally:
+                conn.close()
+        except Exception:
+            pass  # dacă tabelul nu există încă, nu facem nimic
+        return site_id
+
     def _execute_with_retry(self, sql: str, params=(), retries: int = 5,
                              delay: float = 0.5) -> sqlite3.Cursor:
         """
@@ -283,6 +307,9 @@ class TrafficDB:
         """
         if df is None or df.empty:
             return 0
+
+        # Dacă postul a fost redenumit, folosim automat codul nou
+        site_id = self._resolve_contor_alias(site_id)
 
         df = df.copy()
 

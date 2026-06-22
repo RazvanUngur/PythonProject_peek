@@ -603,7 +603,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             win.after(0, lambda: _log_win(f"  Fișiere .bin găsite: {len(fisiere)}\n"))
 
-            mutate = 0; negasite = 0; existente = 0; erori = 0
+            mutate = 0; suprascrise = 0; negasite = 0; erori = 0
 
             for fisier in sorted(fisiere):
                 cale_sursa = os.path.join(sursa, fisier)
@@ -623,20 +623,18 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
                 folder_dest = folder_map[site_id]
                 cale_dest   = os.path.join(folder_dest, fisier)
-
-                if os.path.exists(cale_dest):
-                    msg = f"  ⏭️  {fisier}  →  deja există în {os.path.basename(folder_dest)}"
-                    win.after(0, lambda m=msg: _log_win(m))
-                    existente += 1
-                    continue
+                exista_deja = os.path.exists(cale_dest)
 
                 try:
                     shutil.move(cale_sursa, cale_dest)
-                    msg = f"  ✅  {fisier}  →  {os.path.basename(folder_dest)}"
+                    if exista_deja:
+                        msg = f"  🔄  {fisier}  →  {os.path.basename(folder_dest)}  (suprascriere)"
+                        suprascrise += 1
+                    else:
+                        msg = f"  ✅  {fisier}  →  {os.path.basename(folder_dest)}"
+                        mutate += 1
                     win.after(0, lambda m=msg: _log_win(m))
-                    # Log si in jurnalul principal
                     self.after(0, lambda m=msg: self._log(m))
-                    mutate += 1
                 except Exception as e:
                     msg = f"  ❌  {fisier}  →  eroare: {e}"
                     win.after(0, lambda m=msg: _log_win(m))
@@ -645,7 +643,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             sumar = (
                 f"\n{'─'*55}\n"
                 f"  ✅  Mutate cu succes:   {mutate}\n"
-                f"  ⏭️  Deja existente:     {existente}\n"
+                f"  🔄  Suprascrise:        {suprascrise}\n"
                 f"  ❓  Fără folder:        {negasite}\n"
                 f"  ❌  Erori:              {erori}\n"
                 f"{'─'*55}"
@@ -653,7 +651,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             win.after(0, lambda: _log_win(sumar))
             self.after(0, lambda: self._log(
                 f"  📦  Sortare .bin finalizată — "
-                f"mutate: {mutate}, existente: {existente}, "
+                f"mutate: {mutate}, suprascrise: {suprascrise}, "
                 f"fără folder: {negasite}, erori: {erori}"))
             win.after(0, lambda: btn_start.configure(state="normal"))
 
@@ -1156,9 +1154,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             self._update_progress(100, f"✔  Finalizat — {n_total} contoar{'e' if n_total!=1 else ''} procesat{'e' if n_total!=1 else ''}.")
 
-            out_path = (os.path.dirname(os.path.abspath(self.selected_files[0]))
-                        if self.selected_files else
-                        os.path.dirname(os.path.abspath(self.selected_log_files[0])))
+            rapoarte_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
 
             lines = ["Procesare finalizata!\n"]
             if rezultate_bin:
@@ -1167,7 +1163,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             if rezultate_log:
                 lines.append(f"📦 .LOG — {len(rezultate_log)} contoar{'e' if n_total!=1 else ''}  "
                              f"({sum(r['randuri'] for r in rezultate_log):,} ore)")
-            lines.append(f"\nFisier{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{out_path}")
+            lines.append(f"\nRaport{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{rapoarte_dir}")
             messagebox.showinfo("Succes", "\n".join(lines))
 
         except Exception as ex:
@@ -1369,9 +1365,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._update_progress(100,
                 f"✔  Finalizat — {n_total} contoar{'e' if n_total!=1 else ''} procesat{'e' if n_total!=1 else ''}.")
 
-            out_path = (os.path.dirname(os.path.abspath(self.selected_files[0]))
-                        if self.selected_files else
-                        os.path.dirname(os.path.abspath(self.selected_log_files[0])))
+            rapoarte_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
 
             lines = ["Procesare finalizata!\n"]
             if rezultate_bin:
@@ -1380,7 +1374,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             if rezultate_log:
                 lines.append(f"📦 .LOG — {len(rezultate_log)} contoar{'e' if len(rezultate_log)!=1 else ''}  "
                              f"({sum(r['randuri'] for r in rezultate_log):,} ore)")
-            lines.append(f"\nFisier{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{out_path}")
+            lines.append(f"\nRaport{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{rapoarte_dir}")
             messagebox.showinfo("Succes", "\n".join(lines))
 
         except Exception as ex:
@@ -1542,13 +1536,28 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 tree.delete(row)
             # Citim din SQLite — sursa principală (are DRDP/lat/lng)
             try:
-                from database import get_contoare_db
+                from database import get_contoare_db, CONTOARE_DB
                 db_sql = get_contoare_db().get_all()
             except Exception:
                 db_sql = {}
             # Fallback: completăm cu contoare din Excel care nu sunt încă în SQLite
             db_excel = _load_contoare_db()
-            ct_ids = sorted(set(list(db_sql.keys()) + list(db_excel.keys())))
+
+            # Excludem codurile vechi redenumite (din contor_alias)
+            try:
+                import sqlite3 as _sqlite3
+                _conn = _sqlite3.connect(CONTOARE_DB, timeout=5)
+                _coduri_vechi = {
+                    r[0] for r in
+                    _conn.execute("SELECT cod_vechi FROM contor_alias").fetchall()
+                }
+                _conn.close()
+            except Exception:
+                _coduri_vechi = set()
+
+            ct_ids = sorted(
+                (set(db_sql.keys()) | set(db_excel.keys())) - _coduri_vechi
+            )
 
             def _fmt_coord(v):
                 try:

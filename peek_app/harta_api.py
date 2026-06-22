@@ -159,6 +159,23 @@ def _stats_contor(contor: str, an_ref: int, luna_ref: int) -> dict:
         conn.close()
 
 
+# ── Coduri vechi redenumite (de exclus din hartă) ────────────────────────────
+def _get_coduri_vechi() -> set:
+    """
+    Returnează setul de coduri vechi din contor_alias — acestea nu mai
+    trebuie afișate pe hartă, datele lor au fost migrate la codul nou.
+    """
+    try:
+        conn = sqlite3.connect(CONTOARE_DB, timeout=10)
+        try:
+            rows = conn.execute("SELECT cod_vechi FROM contor_alias").fetchall()
+            return {r[0] for r in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return set()  # tabelul nu există încă — nicio excludere
+
+
 # ── Build răspuns complet ─────────────────────────────────────────────────────
 def _build_response() -> list:
     an_ref, luna_ref = _luna_referinta()
@@ -168,7 +185,12 @@ def _build_response() -> list:
 
     contoare_dict    = cdb.get_all()
     contoare_cu_date = set(tdb.get_contoare_disponibile())
-    toti             = sorted(set(contoare_dict.keys()) | contoare_cu_date)
+    coduri_vechi     = _get_coduri_vechi()  # exclude codurile redenumite
+
+    # Excludem codurile vechi din ambele surse
+    toti = sorted(
+        (set(contoare_dict.keys()) | contoare_cu_date) - coduri_vechi
+    )
 
     result = []
     for contor in toti:

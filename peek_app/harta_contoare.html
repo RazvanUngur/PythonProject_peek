@@ -113,9 +113,9 @@
     /* ── Popup Leaflet ── */
     .cestrin-popup .leaflet-popup-content-wrapper {
       border-radius:10px!important; box-shadow:0 8px 32px rgba(0,0,0,.16)!important;
-      padding:0!important; border:1px solid #e2e8f0;
+      padding:0!important; border:1px solid #e2e8f0; width:260px!important;
     }
-    .cestrin-popup .leaflet-popup-content { margin:14px 16px!important; }
+    .cestrin-popup .leaflet-popup-content { margin:14px 16px!important; width:auto!important; }
     .cestrin-popup .leaflet-popup-tip     { background:white!important; }
 
     .popup-header { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
@@ -338,7 +338,7 @@ function rebuildMarkers() {
       zIndexOffset: isSel ? 1000 : 0,
       title: c.contor,
     });
-    m.bindPopup(buildPopup(c), { maxWidth:360, className:"cestrin-popup" });
+    m.bindPopup(buildPopup(c), { minWidth:260, maxWidth:360, className:"cestrin-popup" });
     m.on("click", () => { selectedId = c.contor; renderList(); });
     m.on("popupclose", () => { selectedId = null; renderList(); });
     m.addTo(map);
@@ -355,7 +355,7 @@ function rebuildMarkers() {
       title: `${c.contor} — trage pe poziția corectă`,
       zIndexOffset: 500,
     });
-    m.bindPopup(buildPopup(c), { maxWidth:360, className:"cestrin-popup" });
+    m.bindPopup(buildPopup(c), { minWidth:260, maxWidth:360, className:"cestrin-popup" });
     m.on("click", () => { selectedId = c.contor; renderList(); m.openPopup(); });
 
     m.on("dragend", (e) => {

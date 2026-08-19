@@ -170,7 +170,9 @@ CREATE TABLE IF NOT EXISTS fisiere_procesate (
     tip_sursa       TEXT    NOT NULL,
     inregistrari    INTEGER DEFAULT 0,
     procesat_la     TEXT    NOT NULL,
-    checksum        TEXT    DEFAULT ''
+    checksum        TEXT    DEFAULT '',
+    perioada_min    TEXT    DEFAULT '',
+    perioada_max    TEXT    DEFAULT ''
 );
 """
 
@@ -243,6 +245,26 @@ class TrafficDB:
         conn = self._conn()
         conn.executescript(_TRAFFIC_SCHEMA)
         conn.commit()
+        self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn):
+        """
+        Migrări aditive pentru DB-uri create înainte de introducerea unor
+        coloane noi. SQLite nu suportă `ADD COLUMN IF NOT EXISTS`, deci
+        verificăm manual prin PRAGMA table_info.
+        """
+        try:
+            cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(fisiere_procesate)").fetchall()}
+            if "perioada_min" not in cols:
+                conn.execute(
+                    "ALTER TABLE fisiere_procesate ADD COLUMN perioada_min TEXT DEFAULT ''")
+            if "perioada_max" not in cols:
+                conn.execute(
+                    "ALTER TABLE fisiere_procesate ADD COLUMN perioada_max TEXT DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass  # migrare best-effort; nu blocăm pornirea aplicației
 
     @staticmethod
     def _resolve_contor_alias(site_id: str) -> str:
@@ -300,10 +322,20 @@ class TrafficDB:
 
     def upsert_hourly_df(self, df: pd.DataFrame, site_id: str,
                          tip_sursa: str = "PEEK",
-                         source_files: list = None) -> int:
+                         source_files: list = None,
+                         source_file_periods: dict = None) -> int:
         """
         Inserează/actualizează date orare dintr-un DataFrame pandas.
         Returnează numărul de rânduri scrise.
+
+        source_file_periods: dict opțional {basename → (perioada_min, perioada_max)}
+        cu perioada REALĂ a fiecărui fișier individual (calculată de parser
+        din conținutul lui brut, înainte de orice concatenare/deduplicare pe
+        contor). Dacă e furnizat, se salvează per-fișier în `fisiere_procesate`,
+        astfel încât fiecare fișier procesat vreodată să-și păstreze propria
+        perioadă vizibilă, indiferent dacă a fost procesat singur sau
+        împreună cu alte fișiere pentru același contor (caz în care coloana
+        `source_file` din `inregistrari_orare` e comună pentru tot lotul).
         """
         if df is None or df.empty:
             return 0
@@ -367,16 +399,23 @@ class TrafficDB:
         conn.executemany(sql, rows)
         conn.commit()
 
-        # Log fișiere procesate
+        # Log fișiere procesate — fiecare fișier își păstrează PROPRIA
+        # perioadă (din source_file_periods), nu perioada agregată a lotului.
         if source_files:
             for fp in source_files:
+                fname = os.path.basename(fp)
+                p_min = p_max = ""
+                if source_file_periods and fname in source_file_periods:
+                    p_min, p_max = source_file_periods[fname]
                 conn.execute("""
                     INSERT OR REPLACE INTO fisiere_procesate
-                    (cale_fisier, contor, tip_sursa, inregistrari, procesat_la)
-                    VALUES (?, ?, ?, ?, ?)
+                    (cale_fisier, contor, tip_sursa, inregistrari, procesat_la,
+                     perioada_min, perioada_max)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     os.path.abspath(fp), str(site_id), tip_sursa,
-                    len(rows), datetime.now().isoformat(timespec="seconds")
+                    len(rows), datetime.now().isoformat(timespec="seconds"),
+                    p_min, p_max
                 ))
             conn.commit()
 
@@ -440,7 +479,13 @@ class TrafficDB:
         """
         Returnează lista căilor complete ale fișierelor sursă procesate
         pentru un contor, în ordinea procesării.
-        Folosit de log_parser pentru a popula secțiunea Fișiere sursă din Excel.
+
+        Notă: `fisiere_procesate` are cheie primară pe calea completă, deci
+        dacă un fișier e mutat în alt folder și reprocesat, apare aici de
+        două ori (calea veche + calea nouă) — comportament intenționat,
+        pentru a păstra vizibil istoricul complet. Vezi `get_source_files_periods()`
+        pentru varianta cu perioada de date aferentă fiecărui fișier, folosită
+        de raportul "Fișiere sursă" din Excel.
         """
         rows = self._conn().execute(
             "SELECT cale_fisier FROM fisiere_procesate "
@@ -448,6 +493,72 @@ class TrafficDB:
             (contor,)
         ).fetchall()
         return [r["cale_fisier"] for r in rows]
+
+    def get_source_files_periods(self, contor: str) -> list:
+        """
+        Returnează fișierele sursă procesate pentru un contor, cu perioada
+        proprie fiecăruia (salvată direct la procesare, în
+        `fisiere_procesate.perioada_min/max` — vezi `upsert_hourly_df`).
+
+        Deduplicare pe NUME de fișier (basename): dacă același fișier
+        .bin/.log a fost procesat de mai multe ori din căi diferite (mutat,
+        redenumit folderul, reprocesat manual etc.), se păstrează DOAR
+        ultima cale procesată (după `procesat_la`), cu perioada ei —
+        variantele vechi ale aceluiași fișier nu mai apar în listă.
+
+        Returnează o listă de dict-uri, sortată cronologic după începutul
+        perioadei (fișierele fără perioadă cunoscută apar la final):
+            {
+                "fisiere": [basename],
+                "cai":     [cale_completă],   # ultima cale cunoscută
+                "perioada_min": "dd.mm.yyyy" | "",
+                "perioada_max": "dd.mm.yyyy" | "",
+                "n_inregistrari": int,
+            }
+        """
+        rows = self._conn().execute("""
+            SELECT cale_fisier, inregistrari, perioada_min, perioada_max, procesat_la
+            FROM fisiere_procesate
+            WHERE contor = ?
+        """, (contor,)).fetchall()
+
+        if not rows:
+            return []
+
+        # Păstrăm doar ultima procesare (procesat_la cel mai recent) per
+        # basename — procesat_la e ISO ("YYYY-MM-DDTHH:MM:SS"), deci
+        # comparabil direct ca string.
+        latest_by_basename = {}
+        for r in rows:
+            bn = os.path.basename(r["cale_fisier"])
+            prev = latest_by_basename.get(bn)
+            if prev is None or (r["procesat_la"] or "") > (prev["procesat_la"] or ""):
+                latest_by_basename[bn] = r
+
+        def _sort_key(p_min):
+            d = self._parse_ro_date_safe(p_min)
+            from datetime import date as _date
+            return (d is None, d or _date.max)
+
+        result = [{
+            "fisiere":        [os.path.basename(r["cale_fisier"])],
+            "cai":            [r["cale_fisier"]],
+            "perioada_min":   r["perioada_min"] or "",
+            "perioada_max":   r["perioada_max"] or "",
+            "n_inregistrari": r["inregistrari"],
+        } for r in latest_by_basename.values()]
+
+        result.sort(key=lambda x: _sort_key(x["perioada_min"]))
+        return result
+
+    @staticmethod
+    def _parse_ro_date_safe(s):
+        try:
+            return datetime.strptime(str(s).strip(), "%d.%m.%Y").date()
+        except Exception:
+            return None
+
+        return result
 
     def fisier_procesat(self, filepath: str) -> bool:
         row = self._conn().execute(

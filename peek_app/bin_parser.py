@@ -908,7 +908,8 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
                 df_total,          # df_total păstrează N_Benzi
                 site_id,
                 tip_sursa="PEEK",
-                source_files=contoare_files.get(site_id, [])
+                source_files=contoare_files.get(site_id, []),
+                source_file_periods=file_periods
             )
             print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare")
         except Exception as _e_db:

@@ -3,6 +3,14 @@
 # =============================================================================
 # Exportă:
 #   update_centralizator(excel_path, site_id, central_folder)
+#       — actualizează un SINGUR contor (compatibilitate; rescrie fișierul).
+#   update_centralizator_batch(rezultate, central_folder, log_callback=None)
+#       — actualizează TOATE contoarele dintr-o rulare cu O SINGURĂ rescriere
+#         a fișierului. De preferat la procesare în masă (vezi app.py) —
+#         apelul update_centralizator() în buclă rescrie integral fișierul
+#         (inclusiv sheet-urile Contoare/Analiza/Reguli Calcul + backup) de
+#         N ori, ceea ce devine foarte costisitor pe măsură ce fișierul
+#         crește (comportament O(N²)).
 # =============================================================================
 
 import os
@@ -135,8 +143,17 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
 # ══════════════════════════════════════════════════════════════════════════════
 # PASUL 2 — update_centralizator (cu sheet "Contoare" persistent de la col B)
 # ══════════════════════════════════════════════════════════════════════════════
-def update_centralizator(excel_path, site_id, central_folder):
+def _write_centralizator_file(df_final, _last_user):
+    """
+    Scrie/rescrie fișierul 0_Centralizator_PEEK-VEK.xlsx complet (sheet-urile
+    "Media Zilnica Lunara", "Contoare", "Prelucrare manuala", "Analiza" cu
+    grafice, "Reguli Calcul") pornind de la df_final — datele deja consolidate
+    pentru TOATE contoarele. Face și backup-ul zilnic în "Istoric Procesari".
 
+    Acesta e pasul costisitor (rescriere completă + grafice + backup), motiv
+    pentru care trebuie apelat O SINGURĂ DATĂ per rulare, nu per contor —
+    vezi update_centralizator_batch().
+    """
     C_DARK   = "1F4E79"
     C_MID    = "2E75B6"
     C_LIGHT  = "D6E4F0"
@@ -166,97 +183,6 @@ def update_centralizator(excel_path, site_id, central_folder):
     # Centralizatorul e mereu la calea fixă, indiferent de unde vin fișierele .bin
     os.makedirs(CENTRAL_FILE_FOLDER, exist_ok=True)
     CENTRAL_FILE = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
-
-    # ── 0. Citim ultimul utilizator care a salvat fișierul ────────────────────
-    # openpyxl expune wb.properties.lastModifiedBy — numele din profilul Windows
-    # al ultimului utilizator care a salvat centralizatorul (Excel îl scrie automat).
-    _last_user = ""
-    if os.path.exists(CENTRAL_FILE):
-        try:
-            _wb_meta = openpyxl.load_workbook(CENTRAL_FILE, read_only=True,
-                                               data_only=True)
-            _last_user = (_wb_meta.properties.lastModifiedBy or "").strip()
-            _wb_meta.close()
-        except Exception:
-            _last_user = ""
-    # Fallback: username Windows curent dacă nu avem info din fișier
-    if not _last_user:
-        try:
-            import getpass
-            _last_user = getpass.getuser()
-        except Exception:
-            _last_user = "Necunoscut"
-
-    # ── 1. Date noi din raport ────────────────────────────────────────────────
-    df_new = _read_lunar_sheet_from_report(excel_path, site_id)
-
-    # ── 2. Citire date persistente din sheet-ul "Media Zilnica Lunara" ──────────
-    if os.path.exists(CENTRAL_FILE):
-        try:
-            wb_ex = openpyxl.load_workbook(CENTRAL_FILE, data_only=True)
-
-            # ── Merge "Media Zilnica Lunara" ──────────────────────────────
-            ws_ex = wb_ex["Media Zilnica Lunara"]
-            header_row_ex = None
-            for r in range(1, min(ws_ex.max_row + 1, 10)):
-                v1 = str(ws_ex.cell(r, 1).value or "").strip()
-                v2 = str(ws_ex.cell(r, 2).value or "").strip()
-                v3 = str(ws_ex.cell(r, 3).value or "").strip()
-                if v1 == "Contor" and v2 == "An" and v3 == "Luna":
-                    header_row_ex = r
-                    break
-
-            if header_row_ex:
-                ex_headers = {}
-                for c in range(1, ws_ex.max_column + 1):
-                    v = ws_ex.cell(header_row_ex, c).value
-                    if v is not None:
-                        ex_headers[str(v).strip()] = c
-
-                rows_ex = []
-                for r in range(header_row_ex + 1, ws_ex.max_row + 1):
-                    ct = ws_ex.cell(r, 1).value
-                    an = ws_ex.cell(r, 2).value
-                    lu = ws_ex.cell(r, 3).value
-                    if ct is None or an is None:
-                        continue
-                    try:
-                        an_int = int(float(str(an)))
-                        lu_int = int(float(str(lu))) if lu is not None else 0
-                    except Exception:
-                        continue
-                    if not (2000 <= an_int <= 2100):
-                        continue
-                    if not (1 <= lu_int <= 12):
-                        continue
-                    if str(ct).strip() == str(site_id):
-                        continue  # va fi rescris cu datele noi
-
-                    row_dict = {}
-                    for col_name, col_idx in ex_headers.items():
-                        row_dict[col_name] = ws_ex.cell(r, col_idx).value
-                    rows_ex.append(row_dict)
-
-                wb_ex.close()
-                df_final = pd.concat(
-                    [pd.DataFrame(rows_ex), df_new], ignore_index=True
-                ) if rows_ex else df_new
-            else:
-                wb_ex.close()
-                df_final = df_new
-
-        except Exception:
-            df_final = df_new
-    else:
-        df_final = df_new
-
-    # ── 3. Sortare ────────────────────────────────────────────────────────────
-    for col in ['An', 'Luna']:
-        if col in df_final.columns:
-            df_final[col] = pd.to_numeric(df_final[col], errors='coerce')
-    df_final = df_final.sort_values(
-        [c for c in ['Contor', 'An', 'Luna'] if c in df_final.columns]
-    ).reset_index(drop=True)
 
     # ── 4. Citim baza de date Contoare din SQLite (sursa unică de adevăr) ──────
     # contoare.db este sursa principală — nu mai depindem de snapshot-ul Excel.
@@ -983,4 +909,158 @@ def update_centralizator(excel_path, site_id, central_folder):
     # ─────────────────────────────────────────────────────────────────────────
 
     return CENTRAL_FILE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASUL 3 — update_centralizator_batch (rescriere O SINGURĂ DATĂ pentru N contoare)
+# ══════════════════════════════════════════════════════════════════════════════
+def update_centralizator_batch(rezultate, central_folder, log_callback=None):
+    """
+    Actualizează centralizatorul o SINGURĂ dată pentru toate contoarele din
+    `rezultate`, în loc de o rescriere completă a fișierului per contor.
+
+    rezultate:    listă de dict-uri cu cheile 'path' (raport Excel individual
+                  al contorului) și 'id' (codul postului) — exact formatul
+                  folosit deja de update_centralizator().
+    central_folder: păstrat pentru compatibilitate cu semnătura veche
+                  (calea reală e CENTRAL_FILE_FOLDER din config, ca și înainte).
+    log_callback: opțional, func(str) — apelat cu un mesaj pentru fiecare
+                  contor al cărui raport nu a putut fi citit; restul batch-ului
+                  continuă normal (nu se oprește la un singur fișier stricat).
+
+    Returnează (CENTRAL_FILE, erori), unde erori e o listă de tuple
+    (site_id, exceptie) pentru contoarele care au eșuat la citire.
+    """
+    os.makedirs(CENTRAL_FILE_FOLDER, exist_ok=True)
+    CENTRAL_FILE = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+
+    # ── 0. Ultimul utilizator care a salvat fișierul (o singură citire) ────────
+    _last_user = ""
+    if os.path.exists(CENTRAL_FILE):
+        try:
+            _wb_meta = openpyxl.load_workbook(CENTRAL_FILE, read_only=True,
+                                               data_only=True)
+            _last_user = (_wb_meta.properties.lastModifiedBy or "").strip()
+            _wb_meta.close()
+        except Exception:
+            _last_user = ""
+    if not _last_user:
+        try:
+            import getpass
+            _last_user = getpass.getuser()
+        except Exception:
+            _last_user = "Necunoscut"
+
+    # ── 1. Date noi din TOATE rapoartele, izolat per contor ─────────────────
+    # O eroare la citirea unui raport individual nu oprește restul batch-ului.
+    df_new_list = []
+    site_ids = set()
+    erori = []
+    for r in rezultate:
+        try:
+            df_r = _read_lunar_sheet_from_report(r["path"], r["id"])
+            df_new_list.append(df_r)
+            site_ids.add(str(r["id"]))
+        except Exception as e_c:
+            erori.append((r.get("id"), e_c))
+            if log_callback:
+                try:
+                    log_callback(f"  ⚠ Centralizator eroare [{r.get('id')}]: {e_c}")
+                except Exception:
+                    pass
+
+    if not df_new_list:
+        return CENTRAL_FILE, erori
+
+    df_new = pd.concat(df_new_list, ignore_index=True)
+
+    # ── 2. Citire date persistente din sheet-ul "Media Zilnica Lunara" ─────────
+    # La fel ca în update_centralizator(), dar excludem TOATE contoarele din
+    # batch deodată (nu doar unul), pentru că vor fi rescrise cu datele noi.
+    if os.path.exists(CENTRAL_FILE):
+        try:
+            wb_ex = openpyxl.load_workbook(CENTRAL_FILE, data_only=True)
+            ws_ex = wb_ex["Media Zilnica Lunara"]
+            header_row_ex = None
+            for r_ in range(1, min(ws_ex.max_row + 1, 10)):
+                v1 = str(ws_ex.cell(r_, 1).value or "").strip()
+                v2 = str(ws_ex.cell(r_, 2).value or "").strip()
+                v3 = str(ws_ex.cell(r_, 3).value or "").strip()
+                if v1 == "Contor" and v2 == "An" and v3 == "Luna":
+                    header_row_ex = r_
+                    break
+
+            if header_row_ex:
+                ex_headers = {}
+                for c in range(1, ws_ex.max_column + 1):
+                    v = ws_ex.cell(header_row_ex, c).value
+                    if v is not None:
+                        ex_headers[str(v).strip()] = c
+
+                rows_ex = []
+                for r_ in range(header_row_ex + 1, ws_ex.max_row + 1):
+                    ct = ws_ex.cell(r_, 1).value
+                    an = ws_ex.cell(r_, 2).value
+                    lu = ws_ex.cell(r_, 3).value
+                    if ct is None or an is None:
+                        continue
+                    try:
+                        an_int = int(float(str(an)))
+                        lu_int = int(float(str(lu))) if lu is not None else 0
+                    except Exception:
+                        continue
+                    if not (2000 <= an_int <= 2100):
+                        continue
+                    if not (1 <= lu_int <= 12):
+                        continue
+                    if str(ct).strip() in site_ids:
+                        continue  # va fi rescris cu datele noi din batch
+
+                    row_dict = {}
+                    for col_name, col_idx in ex_headers.items():
+                        row_dict[col_name] = ws_ex.cell(r_, col_idx).value
+                    rows_ex.append(row_dict)
+
+                wb_ex.close()
+                df_final = pd.concat(
+                    [pd.DataFrame(rows_ex), df_new], ignore_index=True
+                ) if rows_ex else df_new
+            else:
+                wb_ex.close()
+                df_final = df_new
+        except Exception:
+            df_final = df_new
+    else:
+        df_final = df_new
+
+    # ── 3. Sortare ────────────────────────────────────────────────────────────
+    for col in ['An', 'Luna']:
+        if col in df_final.columns:
+            df_final[col] = pd.to_numeric(df_final[col], errors='coerce')
+    df_final = df_final.sort_values(
+        [c for c in ['Contor', 'An', 'Luna'] if c in df_final.columns]
+    ).reset_index(drop=True)
+
+    # ── 4+. Scriere efectivă — O SINGURĂ DATĂ pentru tot batch-ul ──────────────
+    _write_centralizator_file(df_final, _last_user)
+
+    return CENTRAL_FILE, erori
+
+
+def update_centralizator(excel_path, site_id, central_folder):
+    """
+    Wrapper de compatibilitate — actualizează centralizatorul pentru UN
+    SINGUR contor (rescrie fișierul integral, ca înainte).
+
+    Pentru procesare în masă (mai multe contoare într-o rulare), folosiți
+    update_centralizator_batch() — face o singură rescriere pentru tot
+    batch-ul în loc de una per contor, ceea ce reduce drastic timpul total
+    (rescrierea completă, cu grafice și backup, e costul dominant, nu citirea
+    datelor).
+    """
+    _central_file, erori = update_centralizator_batch(
+        [{"path": excel_path, "id": site_id}], central_folder)
+    if erori:
+        raise erori[0][1]
+    return _central_file
 

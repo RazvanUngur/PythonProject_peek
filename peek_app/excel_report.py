@@ -7,6 +7,7 @@
 
 import os
 import calendar
+import time as _time_perf
 import pandas as pd
 import openpyxl
 from openpyxl import load_workbook
@@ -25,6 +26,24 @@ from config import (
     MIN_ORE_ZI, BAND_COLORS,
     CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME,
 )
+
+# =============================================================================
+# Instrumentare performanță — timp cumulat petrecut la construirea foii
+# "Date detaliate prelucrate" (granularitate orară), separat de restul
+# raportului. Acumulează peste MAI MULTE apeluri (un apel per contor), ca să
+# poți citi totalul după o rulare completă pe N contoare. Apelantul (app.py)
+# trebuie să facă reset_ddp_perf() înainte de fiecare bloc de procesare
+# (.bin / .log) și get_ddp_perf_seconds() după, ca să obțină timpul aferent
+# acelui bloc.
+# =============================================================================
+_DDP_PERF_SECONDS = 0.0
+
+def reset_ddp_perf():
+    global _DDP_PERF_SECONDS
+    _DDP_PERF_SECONDS = 0.0
+
+def get_ddp_perf_seconds():
+    return _DDP_PERF_SECONDS
 
 def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source_file_periods=None):
     MIN_ORE_ZI    = 22
@@ -47,23 +66,48 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     # Culori benzi
     BAND_COLORS = ["2E75B6", "ED7D31", "70AD47", "FFC000", "5B9BD5", "FF0000"]
 
+    # ── Cache stiluri ────────────────────────────────────────────────────────
+    # fill()/hfont()/dfont() creau câte un obiect NOU la fiecare celulă (sute de
+    # mii pe raport, la foile cu granularitate orară). openpyxl compară stilurile
+    # după valoare, deci rezultatul e identic dacă refolosim aceleași obiecte —
+    # doar viteza de scriere se schimbă (măsurat: ~4-5x mai rapid pe partea de
+    # stilizare). ctr()/rgt() nu au parametri, deci sunt simple singleton-uri.
+    _fill_cache = {}
+    _font_cache = {}
+    _ALIGN_CTR = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    _ALIGN_RGT = Alignment(horizontal='right', vertical='center')
+
     def fill(hex_c):
-        return PatternFill('solid', start_color=hex_c)
+        _f = _fill_cache.get(hex_c)
+        if _f is None:
+            _f = PatternFill('solid', start_color=hex_c)
+            _fill_cache[hex_c] = _f
+        return _f
 
     thin = Side(style='thin', color='BFBFBF')
     brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     def hfont(sz=10):
-        return Font(name='Arial', size=sz, bold=True, color=C_WHITE)
+        _key = ('h', sz)
+        _fnt = _font_cache.get(_key)
+        if _fnt is None:
+            _fnt = Font(name='Arial', size=sz, bold=True, color=C_WHITE)
+            _font_cache[_key] = _fnt
+        return _fnt
 
     def dfont(sz=10, bold=False, color="1F1F1F"):
-        return Font(name='Arial', size=sz, bold=bold, color=color)
+        _key = ('d', sz, bold, color)
+        _fnt = _font_cache.get(_key)
+        if _fnt is None:
+            _fnt = Font(name='Arial', size=sz, bold=bold, color=color)
+            _font_cache[_key] = _fnt
+        return _fnt
 
     def ctr():
-        return Alignment(horizontal='center', vertical='center', wrap_text=True)
+        return _ALIGN_CTR
 
     def rgt():
-        return Alignment(horizontal='right', vertical='center')
+        return _ALIGN_RGT
 
     days_ro = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică']
 
@@ -782,6 +826,205 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         _c3=ws_dp.cell(_dp_row,_ci,""); _c3.fill=fill(C_GREEN); _c3.border=brd
     ws_dp.freeze_panes = "C4"
     ws_dp.row_dimensions[_dp_row].height = 22
+
+    # ── FOAIE 3b: Date detaliate prelucrate (reconstrucție benzi pe interval orar) ──
+    # Aceeași logică de reconstrucție C/T/D ca la "Date prelucrate", dar aplicată
+    # per interval orar (Zi + Oră) în loc de agregare zilnică.
+    _t_ddp_start = _time_perf.perf_counter()   # ⏱ instrumentare — vezi get_ddp_perf_seconds()
+    ws_ddp = wb.create_sheet("Date detaliate prelucrate")
+    ws_ddp.sheet_view.showGridLines = False
+
+    _df_ddp   = df.copy()
+    _agg_ddp  = dict(_agg_dp)   # aceleași coloane de clase + Total_BX ca la Date prelucrate
+    _hourly_dp = (_df_ddp.groupby(['Zi', 'Ora']).agg(_agg_ddp).reset_index()
+                          .sort_values(['Zi', 'Ora']).reset_index(drop=True))
+
+    _ddp_hdrs = ["Data", "Ora"]
+    for _s, _sb_list in enumerate([SENS1_B, SENS2_B], 1):
+        for _cls in CLASE_IDX: _ddp_hdrs.append(f"S{_s}_Cls{_cls}")
+        _ddp_hdrs.append(f"S{_s}_Total")
+    _ddp_hdrs += ["Total", "Status benzi", "Tip interval"]
+    _n_ddp = len(_ddp_hdrs)
+    _title_col_ddp = get_column_letter(_n_ddp)
+
+    ws_ddp.merge_cells(f"A1:{_title_col_ddp}1")
+    ws_ddp["A1"] = (f"DATE DETALIATE PRELUCRATE  |  Contor: {site_id}"
+                    + (f"  |  {localitate_site.lstrip(' -')}" if localitate_site else "")
+                    + "  |  Reconstrucție benzi pe interval orar")
+    ws_ddp["A1"].font      = Font(name='Arial', size=13, bold=True, color=C_WHITE)
+    ws_ddp["A1"].fill      = fill(C_DARK)
+    ws_ddp["A1"].alignment = ctr()
+    ws_ddp.row_dimensions[1].height = 28
+
+    ws_ddp.merge_cells(f"A2:{_title_col_ddp}2")
+    ws_ddp["A2"] = ("🟢 Verde=clasificator(real)   🔵 Albastru=reconstituit din pereche   "
+                    "🟡 Galben=totalizator   🔴 Roșu=neutilizabil")
+    ws_ddp["A2"].font      = Font(name='Arial', size=8, italic=True, color="444444")
+    ws_ddp["A2"].fill      = fill("F8F8F8")
+    ws_ddp["A2"].alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    ws_ddp.row_dimensions[2].height = 20
+
+    for _ci, _h in enumerate(_ddp_hdrs, 1):
+        _cell = ws_ddp.cell(3, _ci, _h)
+        _cell.border = brd; _cell.alignment = ctr()
+        if _h in ("Data", "Ora", "Status benzi", "Tip interval"):
+            _cell.font = hfont(9); _cell.fill = fill(C_DARK)
+        elif _h == "Total":
+            _cell.font = hfont(9); _cell.fill = fill("404040")
+        elif _h.startswith("S1_"):
+            _cell.font = hfont(9); _cell.fill = fill("1F4E79")
+        else:
+            _cell.font = hfont(9); _cell.fill = fill("375623")
+    ws_ddp.row_dimensions[3].height = 26
+
+    ws_ddp.column_dimensions['A'].width = 12
+    ws_ddp.column_dimensions['B'].width = 8
+    for _ci in range(3, _n_ddp - 2):
+        ws_ddp.column_dimensions[get_column_letter(_ci)].width = 9
+    ws_ddp.column_dimensions[get_column_letter(_n_ddp - 2)].width = 13  # Total
+    ws_ddp.column_dimensions[get_column_letter(_n_ddp - 1)].width = 20  # Status
+    ws_ddp.column_dimensions[get_column_letter(_n_ddp)].width = 14      # Tip interval
+
+    import datetime as _dtm2
+    _ddp_row = 4
+    for _, _rh in _hourly_dp.iterrows():
+        _zi_date = _rh['Zi']
+        _ora_val = int(_rh['Ora'])
+        _stat = {}; _rcls = {}; _rtot = {}
+        for _b in band_ids:
+            _tot = int(_rh.get(f'Total_B{_b}', 0))
+            _c15 = int(_rh.get(f'B{_b}_Clasa_15', 0))
+            _stat[_b] = _sb(_tot, _c15)
+            _rtot[_b] = _tot
+            _rcls[_b] = {_c: int(_rh.get(f'B{_b}_Clasa_{_c}', 0)) for _c in CLASE_IDX}
+
+        _status_str = ', '.join(_stat[_b] for _b in band_ids)
+        _ocls = {_b: {} for _b in band_ids}
+        _otot = {_b: 0  for _b in band_ids}
+        _osrc = {_b: 'D' for _b in band_ids}
+        _tip_int = 'clasificator'; _null_int = False
+
+        for _b in band_ids:
+            _pb  = perechi[_b]
+            _sb_ = _stat[_b]; _spb = _stat[_pb]
+
+            if _sb_ == 'C':
+                _ocls[_b] = _copy(_rcls[_b]); _otot[_b] = _rtot[_b]; _osrc[_b] = 'C'
+
+            elif _sb_ == 'T':
+                if _spb == 'C' and _rtot[_pb] > 0:
+                    _ocls[_b] = _recon(_rcls[_pb], _rtot[_pb], _rtot[_b])
+                    _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
+                else:
+                    _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_b]) for _c in CLASE_IDX}
+                    _otot[_b] = _rtot[_b]; _osrc[_b] = 'T'; _tip_int = 'totalizator'
+
+            else:  # D
+                if _spb == 'C':
+                    _ss_pb = SENS1_B if _pb in SENS1_B else SENS2_B
+                    _ss_b  = SENS1_B if _b in SENS1_B else SENS2_B
+                    _fip   = [_x for _x in _ss_pb if _x != _pb and _stat[_x] == 'C']
+                    if _fip:
+                        _bfs = [_x for _x in _ss_b if _stat[_x] == 'C']
+                        if _bfs:
+                            _db = _bfs[0]; _rb = perechi[_db]
+                            if _rtot[_rb] > 0:
+                                _sc = (_rtot[_pb] / _rtot[_rb]) * _rtot[_db]
+                                _ocls[_b] = _scale(_rcls[_db], _rtot[_db], round(_sc))
+                                _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
+                            else:
+                                _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+                        else:
+                            _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+                    else:
+                        _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
+
+                elif _spb == 'T':
+                    _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_pb]) for _c in CLASE_IDX}
+                    _otot[_b] = _rtot[_pb]; _osrc[_b] = 'T'; _tip_int = 'totalizator'
+
+                else:  # ambele bande D → caută altă bandă din același sens
+                    _ss_b = SENS1_B if _b in SENS1_B else SENS2_B
+                    _af = [_x for _x in _ss_b if _x != _b and _stat[_x] in ('C', 'T')]
+                    if _af:
+                        _xb = _af[0]; _xpb = perechi[_xb]
+                        if _stat[_xb] == 'C' and _stat[_xpb] == 'C' and _rtot[_xb] > 0:
+                            _ocls[_b] = _copy(_rcls[_xb]); _otot[_b] = _rtot[_xb]; _osrc[_b] = 'R'
+                        else:
+                            _null_int = True; _ocls[_b] = {_c: 0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+                    else:
+                        _null_int = True; _ocls[_b] = {_c: 0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+
+        if _null_int: _tip_int = 'null'
+
+        _row_bg = (F_NULL if _tip_int == 'null' else F_TOT if _tip_int == 'totalizator'
+                   else (F_ALT if _ddp_row % 2 == 0 else "FFFFFF"))
+
+        _zi_obj = _zi_date if hasattr(_zi_date, 'strftime') else _dtm2.date.fromisoformat(str(_zi_date))
+        for _ci, _val in enumerate([_zi_obj.strftime('%d.%m.%Y'), f"{_ora_val:02d}:00"], 1):
+            _c = ws_ddp.cell(_ddp_row, _ci, _val)
+            _c.font = dfont(9); _c.fill = fill(_row_bg); _c.border = brd; _c.alignment = ctr()
+
+        _col = 3; _vs1 = 0; _vs2 = 0
+        for _si, _sbn in enumerate([SENS1_B, SENS2_B]):
+            for _cls in CLASE_IDX:
+                _vc = sum(_ocls[_b].get(_cls, 0) for _b in _sbn)
+                _srcs = [_osrc[_b] for _b in _sbn]
+                _bg = (F_NULL if _tip_int == 'null' or 'N' in _srcs else
+                       F_TOT  if _tip_int == 'totalizator' else
+                       F_RECON if 'R' in _srcs else F_REAL)
+                _c = ws_ddp.cell(_ddp_row, _col, _vc if _tip_int != 'null' else "—")
+                _c.font = dfont(9); _c.fill = fill(_bg); _c.border = brd; _c.alignment = rgt()
+                if isinstance(_vc, int) and _tip_int != 'null': _c.number_format = '#,##0'
+                _col += 1
+            _vst = sum(_otot[_b] for _b in _sbn)
+            if _si == 0: _vs1 = _vst
+            else: _vs2 = _vst
+            _bg_t = (F_NULL if _tip_int == 'null' else F_TOT if _tip_int == 'totalizator' else
+                     F_RECON if any(_osrc[_b] == 'R' for _b in _sbn) else F_REAL)
+            _c = ws_ddp.cell(_ddp_row, _col, _vst if _tip_int != 'null' else "—")
+            _c.font = dfont(9, bold=True); _c.fill = fill(_bg_t); _c.border = brd; _c.alignment = rgt()
+            if isinstance(_vst, int) and _tip_int != 'null': _c.number_format = '#,##0'
+            _col += 1
+
+        _vtg = _vs1 + _vs2
+        _c = ws_ddp.cell(_ddp_row, _col, _vtg if _tip_int != 'null' else "—")
+        _c.font = dfont(9, bold=True); _c.border = brd; _c.alignment = rgt()
+        _c.fill = fill(F_NULL if _tip_int == 'null' else F_TOT if _tip_int == 'totalizator' else "E2EFDA")
+        if isinstance(_vtg, int) and _tip_int != 'null': _c.number_format = '#,##0'
+        _col += 1
+
+        _c = ws_ddp.cell(_ddp_row, _col, _status_str)
+        _c.font = dfont(9); _c.fill = fill(_row_bg); _c.border = brd; _c.alignment = ctr()
+        _col += 1
+
+        _td = {'clasificator': 'Clasificator', 'totalizator': 'Totalizator', 'null': 'Neutilizabil'}.get(_tip_int, _tip_int)
+        _tc = {'clasificator': "1E8449", 'totalizator': "7D6608", 'null': "922B21"}.get(_tip_int, "000000")
+        _c = ws_ddp.cell(_ddp_row, _col, _td)
+        _c.font = Font(name='Arial', size=9, bold=True, color=_tc)
+        _c.fill = fill(_row_bg); _c.border = brd; _c.alignment = ctr()
+
+        ws_ddp.row_dimensions[_ddp_row].height = 16
+        _ddp_row += 1
+
+    # Rând TOTAL
+    ws_ddp.merge_cells(f"A{_ddp_row}:B{_ddp_row}")
+    _tcx = ws_ddp[f"A{_ddp_row}"]
+    _tcx.value = "TOTAL PERIOADĂ"; _tcx.font = dfont(bold=True)
+    _tcx.fill = fill(C_GREEN); _tcx.alignment = ctr(); _tcx.border = brd
+    ws_ddp[f"B{_ddp_row}"].fill = fill(C_GREEN); ws_ddp[f"B{_ddp_row}"].border = brd
+    for _ci in range(3, _n_ddp - 1):
+        _cl = get_column_letter(_ci)
+        _c2 = ws_ddp.cell(_ddp_row, _ci, f'=SUMIF({_cl}4:{_cl}{_ddp_row - 1},"<>—")')
+        _c2.font = dfont(bold=True); _c2.fill = fill(C_GREEN)
+        _c2.border = brd; _c2.alignment = rgt(); _c2.number_format = '#,##0'
+    for _ci in [_n_ddp - 1, _n_ddp]:
+        _c3 = ws_ddp.cell(_ddp_row, _ci, ""); _c3.fill = fill(C_GREEN); _c3.border = brd
+    ws_ddp.freeze_panes = "C4"
+    ws_ddp.row_dimensions[_ddp_row].height = 22
+
+    global _DDP_PERF_SECONDS
+    _DDP_PERF_SECONDS += _time_perf.perf_counter() - _t_ddp_start   # ⏱ instrumentare
 
     # ── FOAIE 4: Media Zilnică Lunară ────────────────────────────────────────
     ws_lunar = wb.create_sheet("Media Zilnica Lunara")
@@ -1920,28 +2163,80 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             cell.alignment = ctr()
             cell.border    = brd
 
-        # Perioada corectă = perioada din Rezumat Zilnic (fallback global)
+        # Perioada corectă = perioada din Rezumat Zilnic (folosită DOAR ca etichetă
+        # pentru rândul unic afișat când nu avem deloc fișiere sursă)
         perioada_globala = f"{first_date} — {last_date}"
 
-        # Completăm rândurile cu fișierele sursă
-        surse = source_files if source_files else []
-        if not surse:
-            surse_display = [("—", "—", perioada_globala)]
+        import datetime as _dtp
+
+        def _parse_ro_date(s):
+            """Parsează 'dd.mm.yyyy' → date, sau None dacă nu se poate."""
+            try:
+                return _dtp.datetime.strptime(str(s).strip(), '%d.%m.%Y').date()
+            except Exception:
+                return None
+
+        surse_display = []
+
+        # ── Sursă principală: interogăm DIRECT DB-ul (fisiere_procesate) ─────
+        # Fiecare fișier .bin/.log procesat pentru acest contor apare cu
+        # perioada lui proprie (salvată la procesare — vezi upsert_hourly_df).
+        # Dacă același fișier a fost reprocesat ulterior dintr-o altă cale
+        # (mutat, redenumit folderul etc.), se afișează DOAR ultima cale
+        # procesată, cu perioada ei — variantele vechi ale aceluiași fișier
+        # sunt eliminate automat (deduplicare pe nume de fișier, în
+        # get_source_files_periods()).
+        try:
+            from database import get_traffic_db as _get_tdb2
+            _live_sources = _get_tdb2().get_source_files_periods(str(site_id))
+        except Exception:
+            _live_sources = []
+
+        if _live_sources:
+            for _s in _live_sources:
+                fname = ", ".join(_s['fisiere'])
+                fpath = ", ".join(_s['cai'])
+                perioad = (f"{_s['perioada_min']} — {_s['perioada_max']}"
+                           if _s['perioada_min'] and _s['perioada_max'] else "necunoscută")
+                surse_display.append((fname, fpath, perioad))
         else:
-            surse_display = []
-            for fp in surse:
-                fname = os.path.basename(fp)
-                fpath = os.path.abspath(fp)
+            # ── Fallback: comportamentul anterior, bazat pe parametrii primiți
+            # de funcție (util dacă DB-ul e indisponibil sau contorul nu are
+            # încă date scrise cu source_file, ex. rulare foarte veche) ───────
+            surse = source_files if source_files else []
+            if not surse:
+                surse_display = [("—", "—", perioada_globala)]
+            else:
+                _raw_entries = []
+                for _idx, fp in enumerate(surse):
+                    fname = os.path.basename(fp)
+                    fpath = os.path.abspath(fp)
 
-                # ── Calculăm perioada per fișier din df ──────────────────────
-                # source_file_periods este un dict opțional {basename → (min, max)}
-                # transmis din parser; dacă nu există, folosim perioada globală
-                perioad_fisier = perioada_globala
-                if source_file_periods and fname in source_file_periods:
-                    p_min, p_max = source_file_periods[fname]
-                    perioad_fisier = f"{p_min} — {p_max}"
+                    p_min = p_max = None
+                    if source_file_periods and fname in source_file_periods:
+                        p_min, p_max = source_file_periods[fname]
 
-                surse_display.append((fname, fpath, perioad_fisier))
+                    d_min = _parse_ro_date(p_min) if p_min else None
+                    d_max = _parse_ro_date(p_max) if p_max else None
+                    perioad_fisier = f"{p_min} — {p_max}" if (p_min and p_max) else "necunoscută"
+
+                    _raw_entries.append({
+                        'idx': _idx, 'fname': fname, 'fpath': fpath,
+                        'perioad': perioad_fisier, 'd_min': d_min, 'd_max': d_max,
+                    })
+
+                # Deduplicare: la perioade identice, păstrăm doar ultimul
+                # fișier procesat (cel inițial nu mai are relevanță).
+                _by_period = {}
+                for _e in _raw_entries:
+                    _key = (_e['d_min'], _e['d_max']) if _e['d_min'] and _e['d_max'] else ('__unk__', _e['idx'])
+                    if _key not in _by_period or _e['idx'] > _by_period[_key]['idx']:
+                        _by_period[_key] = _e
+
+                _deduped = list(_by_period.values())
+                _deduped.sort(key=lambda e: (e['d_min'] is None, e['d_min'] or _dtp.date.max, e['idx']))
+
+                surse_display = [(e['fname'], e['fpath'], e['perioad']) for e in _deduped]
 
         for row_i, (fname, fpath, perioad) in enumerate(surse_display, 1):
             r = start_sursa + 1 + row_i

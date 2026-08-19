@@ -33,7 +33,8 @@ from config import (
 )
 from bin_parser import quick_scan_bin, process_multiple_files
 from log_parser import process_log_files
-from centralizator import update_centralizator
+from centralizator import update_centralizator, update_centralizator_batch
+from excel_report import reset_ddp_perf, get_ddp_perf_seconds
 from contoare_db import _load_contoare_db, _save_contoare_db, _delete_contor_from_centralizator
 from gui_widgets import (
     _rr, _ctk_btn, _make_button, _ctk_frame, _ctk_label,
@@ -41,6 +42,22 @@ from gui_widgets import (
 )
 
 from harta_server import HartaServer
+
+def _format_perf_summary(phases, total_seconds):
+    """
+    Genereaza un raport scurt: unde s-a dus timpul in timpul procesarii.
+    phases: lista de tuple (eticheta, secunde)
+    """
+    if not phases or total_seconds <= 0:
+        return "     (fara date de performanta)"
+    max_label = max(len(lbl) for lbl, _ in phases)
+    linii = []
+    for lbl, secs in phases:
+        pct = (secs / total_seconds) * 100 if total_seconds else 0
+        linii.append(f"     {lbl.ljust(max_label)}   {secs:7.1f}s   ({pct:5.1f}%)")
+    linii.append(f"     {'TOTAL'.ljust(max_label)}   {total_seconds:7.1f}s   (100.0%)")
+    return "\n".join(linii)
+
 
 class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
@@ -657,24 +674,27 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _update_progress(self, percent, text):
-        if CTK_AVAILABLE:
-            self.progress.set(percent / 100)
-        else:
-            self.progress["value"] = percent
-        self.lbl_status.configure(text=text)
-        self.update_idletasks()
+        def _do():
+            if CTK_AVAILABLE:
+                self.progress.set(percent / 100)
+            else:
+                self.progress["value"] = percent
+            self.lbl_status.configure(text=text)
+        self.after(0, _do)
 
     def _log(self, msg):
-        if CTK_AVAILABLE:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        else:
-            self.log_text.config(state="normal")
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-            self.log_text.config(state="disabled")
+        def _do():
+            if CTK_AVAILABLE:
+                self.log_text.configure(state="normal")
+                self.log_text.insert("end", msg + "\n")
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+            else:
+                self.log_text.config(state="normal")
+                self.log_text.insert("end", msg + "\n")
+                self.log_text.see("end")
+                self.log_text.config(state="disabled")
+        self.after(0, _do)
 
     # ── Selectare folder recursiv .bin ────────────────────────────────────────
     def _choose_folder_bin(self):
@@ -956,14 +976,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             total_b2   = sum(r['b2'] for r in rezultate)
 
             self._update_progress(75, f"Actualizez centralizatorul ({n_contoare} contoare)...")
-            for idx_r, r in enumerate(rezultate):
-                if cancelled(): abort(); return          # ← între contoare centralizator
-                pct_c = int(75 + (idx_r / n_contoare) * 20)
-                self._update_progress(pct_c, f"Centralizator {r['id']} ({idx_r+1}/{n_contoare})…")
-                try:
-                    update_centralizator(r['path'], r['id'], CENTRAL_FILE_FOLDER)
-                except Exception as e_c:
-                    self._log(f"  ⚠ Centralizator eroare [{r['id']}]: {e_c}")
+            if cancelled(): abort(); return          # ← înainte de centralizator
+            _, _erori_c = update_centralizator_batch(
+                rezultate, CENTRAL_FILE_FOLDER, log_callback=self._log)
+            self._update_progress(95, "Centralizator actualizat.")
 
             if cancelled(): abort(); return              # ← după centralizator
 
@@ -1064,15 +1080,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     n_c = len(rezultate_bin)
                     self._update_progress(int(bin_pct_end * 0.7),
                                           f"Actualizez centralizatorul ({n_c} contoar{'e' if n_c!=1 else ''} .bin)...")
-                    for idx_r, r in enumerate(rezultate_bin):
-                        if cancelled(): abort(); return
-                        pct_c = int(bin_pct_end * 0.7 + (idx_r / n_c) * bin_pct_end * 0.28)
-                        self._update_progress(pct_c,
-                            f"Centralizator .bin {r['id']} ({idx_r+1}/{n_c})...")
-                        try:
-                            update_centralizator(r["path"], r["id"], CENTRAL_FILE_FOLDER)
-                        except Exception as e_c:
-                            self._log(f"  ⚠ Centralizator eroare [{r['id']}]: {e_c}")
+                    if cancelled(): abort(); return
+                    update_centralizator_batch(
+                        rezultate_bin, CENTRAL_FILE_FOLDER, log_callback=self._log)
+                    self._update_progress(int(bin_pct_end * 0.98), "Centralizator .bin actualizat.")
 
                     t_ore  = sum(r["randuri"] for r in rezultate_bin)
                     t_b1   = sum(r["b1"] for r in rezultate_bin)
@@ -1122,18 +1133,14 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                         f"Actualizez centralizatorul ({n_cl} contoar{'e' if n_cl!=1 else ''} .log)...")
                     self._log(f"\n  📊 Rapoarte .log generate: {n_cl} contoar{'e' if n_cl!=1 else ''}")
 
-                    for idx_r, r in enumerate(rezultate_log):
-                        if cancelled(): abort(); return
-                        pct_c = int(log_pct_start + 20 + (idx_r / n_cl) * 25)
-                        self._update_progress(pct_c,
-                            f"Centralizator .log {r['id']} ({idx_r+1}/{n_cl})...")
+                    for r in rezultate_log:
                         self._log(f"  📥 Centralizator ← [{r['id']}]  "
                                   f"{r['randuri']} ore  │  "
                                   f"B1={r['b1']:,}  B2={r['b2']:,}")
-                        try:
-                            update_centralizator(r["path"], r["id"], CENTRAL_FILE_FOLDER)
-                        except Exception as e_c:
-                            self._log(f"  ⚠ Centralizator eroare [{r['id']}]: {e_c}")
+                    if cancelled(): abort(); return
+                    update_centralizator_batch(
+                        rezultate_log, CENTRAL_FILE_FOLDER, log_callback=self._log)
+                    self._update_progress(log_pct_start + 44, "Centralizator .log actualizat.")
 
                     t_ore_l = sum(r["randuri"] for r in rezultate_log)
                     t_veh_l = sum(r["b1"] + r["b2"] for r in rezultate_log)
@@ -1194,6 +1201,12 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
 
         try:
+            _t_run_start = time.perf_counter()
+            _perf_phases = []
+            _t_phase = _t_run_start
+            _n_bin_ok = 0
+            _n_log_ok = 0
+
             has_bin = bool(self.selected_files)
             has_log = bool(self.selected_log_files)
 
@@ -1232,6 +1245,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 self._update_progress(10, "Se proceseaza datele .bin...")
                 self._log("  🔄 Generare rapoarte Excel (.bin)...")
 
+                _now = time.perf_counter()
+                _perf_phases.append(("Scanare .bin", _now - _t_phase))
+                _t_phase = _now
+
                 # ── Callback progres per contor (apelat din thread-ul bin_parser) ─
                 _bin_proc_start = 10
                 _bin_proc_end   = int(bin_pct_end * 0.65)
@@ -1246,27 +1263,30 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     self.after(0, lambda s=site_id, n=n_ore:
                         self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare"))
 
+                reset_ddp_perf()   # ⏱ instrumentare foaie "Date detaliate prelucrate"
                 rezultate_bin = process_multiple_files(
                     self.selected_files,
                     stop_event=self.stop_event,
                     progress_callback=_bin_progress) or []
                 if self.stop_event.is_set(): abort(); return
 
+                _now = time.perf_counter()
+                _perf_phases.append(("Procesare + SQLite + Excel .bin", _now - _t_phase))
+                _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
+                                      get_ddp_perf_seconds()))
+                _t_phase = _now
+
                 if not rezultate_bin:
                     self._log("\n✗ Nicio data valida gasita in fisierele .bin.")
                 else:
                     n_c = len(rezultate_bin)
+                    _n_bin_ok = n_c
                     self._update_progress(int(bin_pct_end * 0.65),
                         f"Actualizez centralizatorul ({n_c} contoar{'e' if n_c!=1 else ''} .bin)...")
-                    for idx_r, r in enumerate(rezultate_bin):
-                        if cancelled(): abort(); return
-                        pct_c = int(bin_pct_end * 0.65 + (idx_r / n_c) * bin_pct_end * 0.30)
-                        self._update_progress(pct_c,
-                            f"Centralizator .bin {r['id']} ({idx_r+1}/{n_c})...")
-                        try:
-                            update_centralizator(r["path"], r["id"], CENTRAL_FILE_FOLDER)
-                        except Exception as e_c:
-                            self._log(f"  ⚠ Centralizator eroare [{r['id']}]: {e_c}")
+                    if cancelled(): abort(); return
+                    update_centralizator_batch(
+                        rezultate_bin, CENTRAL_FILE_FOLDER, log_callback=self._log)
+                    self._update_progress(int(bin_pct_end * 0.95), "Centralizator .bin actualizat.")
 
                     t_ore  = sum(r["randuri"] for r in rezultate_bin)
                     t_b1   = sum(r["b1"] for r in rezultate_bin)
@@ -1275,6 +1295,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     self._log(f"\n{sep}\n  📦 .BIN:")
                     self._log(f"     Contoar{'e' if n_c!=1 else ''}: {n_c}  │  Ore: {t_ore:,}  │  Trafic: {int(t_b1+t_b2):,}")
                     self._log(f"     Benzi: {lanes_i}\n{sep}")
+
+                _now = time.perf_counter()
+                _perf_phases.append(("Centralizator .bin", _now - _t_phase))
+                _t_phase = _now
 
                 if cancelled(): abort(); return
 
@@ -1294,6 +1318,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     self._update_progress(pct, f"Scanare .log {idx}/{total_log}...")
 
                 if cancelled(): abort(); return
+
+                _now = time.perf_counter()
+                _perf_phases.append(("Scanare .log", _now - _t_phase))
+                _t_phase = _now
 
                 self._update_progress(log_pct_start + 5,
                     "Se genereaza rapoartele Excel (.log)...")
@@ -1316,6 +1344,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     self.after(0, lambda s=site_id, n=n_ore:
                         self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare (VEK)"))
 
+                reset_ddp_perf()   # ⏱ instrumentare foaie "Date detaliate prelucrate"
                 rezultate_log = process_log_files(
                     self.selected_log_files,
                     output_dir=out_dir,
@@ -1324,26 +1353,29 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
                 if self.stop_event.is_set(): abort(); return
 
+                _now = time.perf_counter()
+                _perf_phases.append(("Procesare + SQLite + Excel .log", _now - _t_phase))
+                _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
+                                      get_ddp_perf_seconds()))
+                _t_phase = _now
+
                 if not rezultate_log:
                     self._log("\n✗ Nicio data valida gasita in fisierele .log.")
                 else:
                     n_cl = len(rezultate_log)
+                    _n_log_ok = n_cl
                     self._update_progress(log_pct_start + 20,
                         f"Actualizez centralizatorul ({n_cl} contoar{'e' if n_cl!=1 else ''} .log)...")
                     self._log(f"\n  📊 Rapoarte .log generate: {n_cl} contoar{'e' if n_cl!=1 else ''}")
 
-                    for idx_r, r in enumerate(rezultate_log):
-                        if cancelled(): abort(); return
-                        pct_c = int(log_pct_start + 20 + (idx_r / n_cl) * 25)
-                        self._update_progress(pct_c,
-                            f"Centralizator .log {r['id']} ({idx_r+1}/{n_cl})...")
+                    for r in rezultate_log:
                         self._log(f"  📥 Centralizator ← [{r['id']}]  "
                                   f"{r['randuri']} ore  │  "
                                   f"B1={r['b1']:,}  B2={r['b2']:,}")
-                        try:
-                            update_centralizator(r["path"], r["id"], CENTRAL_FILE_FOLDER)
-                        except Exception as e_c:
-                            self._log(f"  ⚠ Centralizator eroare [{r['id']}]: {e_c}")
+                    if cancelled(): abort(); return
+                    update_centralizator_batch(
+                        rezultate_log, CENTRAL_FILE_FOLDER, log_callback=self._log)
+                    self._update_progress(log_pct_start + 44, "Centralizator .log actualizat.")
 
                     t_ore_l = sum(r["randuri"] for r in rezultate_log)
                     t_veh_l = sum(r["b1"] + r["b2"] for r in rezultate_log)
@@ -1351,6 +1383,11 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     self._log(f"\n{sep}\n  📦 .LOG:")
                     self._log(f"     Contoar{'e' if n_cl!=1 else ''}: {n_cl}  │  Ore: {t_ore_l:,}  │  Trafic: {t_veh_l:,}")
                     self._log(f"     Benzi: {lanes_l}\n{sep}")
+
+            if has_log:
+                _now = time.perf_counter()
+                _perf_phases.append(("Centralizator .log", _now - _t_phase))
+                _t_phase = _now
 
             # ═══════════════════════════════════════════════════════════════
             # SUMAR FINAL
@@ -1367,6 +1404,28 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             rapoarte_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
 
+            _t_run_elapsed = time.perf_counter() - _t_run_start
+            self._log(f"\n{sep}")
+            self._log(f"  ⏱ RAPORT DE PERFORMANȚĂ (unde s-a dus timpul):")
+            self._log(_format_perf_summary(_perf_phases, _t_run_elapsed))
+
+            _perf_dict = dict(_perf_phases)
+            _avg_lines = []
+            if _n_bin_ok:
+                _t_proc_bin = _perf_dict.get("Procesare + SQLite + Excel .bin", 0.0)
+                _avg_lines.append(
+                    f"     Timp mediu / post .bin   ({_n_bin_ok:>2} contoare):   {_t_proc_bin / _n_bin_ok:6.1f}s")
+            if _n_log_ok:
+                _t_proc_log = _perf_dict.get("Procesare + SQLite + Excel .log", 0.0)
+                _avg_lines.append(
+                    f"     Timp mediu / post .log   ({_n_log_ok:>2} contoare):   {_t_proc_log / _n_log_ok:6.1f}s")
+            if (_n_bin_ok + _n_log_ok):
+                _avg_lines.append(
+                    f"     Timp mediu / post total  ({_n_bin_ok + _n_log_ok:>2} contoare):   {_t_run_elapsed / (_n_bin_ok + _n_log_ok):6.1f}s")
+            if _avg_lines:
+                self._log("\n".join(_avg_lines))
+            self._log(sep)
+
             lines = ["Procesare finalizata!\n"]
             if rezultate_bin:
                 lines.append(f"📦 .BIN — {len(rezultate_bin)} contoar{'e' if len(rezultate_bin)!=1 else ''}  "
@@ -1375,7 +1434,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 lines.append(f"📦 .LOG — {len(rezultate_log)} contoar{'e' if len(rezultate_log)!=1 else ''}  "
                              f"({sum(r['randuri'] for r in rezultate_log):,} ore)")
             lines.append(f"\nRaport{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{rapoarte_dir}")
-            messagebox.showinfo("Succes", "\n".join(lines))
+            self.after(0, lambda: messagebox.showinfo("Succes", "\n".join(lines)))
 
         except Exception as ex:
             self._log(f"\n✗ Eroare neasteptata: {ex}")

@@ -283,7 +283,8 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
             n_scrise = tdb.upsert_hourly_df(
                 df_hourly, site_id,
                 tip_sursa="VEK",
-                source_files=files
+                source_files=files,
+                source_file_periods=file_periods
             )
             print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare (VEK)")
         except Exception as _e_db:

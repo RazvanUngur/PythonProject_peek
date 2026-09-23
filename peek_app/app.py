@@ -960,7 +960,9 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._update_progress(10, "Se procesează datele...")
             self._log("  🔄 Generare rapoarte Excel...")
 
-            rezultate = process_multiple_files(self.selected_files, stop_event=self.stop_event)
+            rezultate = process_multiple_files(
+                self.selected_files, stop_event=self.stop_event,
+                warning_callback=self._log)
             if rezultate is None and cancelled():
                 abort(); return
             if not rezultate:
@@ -1071,7 +1073,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 self._log("  🔄 Generare rapoarte Excel (.bin)...")
 
                 rezultate_bin = process_multiple_files(
-                    self.selected_files, stop_event=self.stop_event) or []
+                    self.selected_files, stop_event=self.stop_event,
+                    warning_callback=self._log) or []
                 if self.stop_event.is_set(): abort(); return
 
                 if not rezultate_bin:
@@ -1267,7 +1270,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 rezultate_bin = process_multiple_files(
                     self.selected_files,
                     stop_event=self.stop_event,
-                    progress_callback=_bin_progress) or []
+                    progress_callback=_bin_progress,
+                    warning_callback=self._log) or []
                 if self.stop_event.is_set(): abort(); return
 
                 _now = time.perf_counter()

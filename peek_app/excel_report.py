@@ -18,6 +18,8 @@ from openpyxl.chart.series import DataPoint
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.layout import Layout, ManualLayout
 from openpyxl.chart.text import RichText
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import RichTextProperties, Paragraph, ParagraphProperties, CharacterProperties
 from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterProperties
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -112,6 +114,20 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     days_ro = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică']
 
     wb = load_workbook(excel_path)
+
+    # ── FOAIE 1: "Date Detaliate" (scrisă brut de pandas.to_excel) ───────────
+    # Lărgim coloanele cu timestamp-ul (Timestamp / Data_Ora) ca să se vadă
+    # data+ora complet și activăm filtrul pe rândul de antet, pentru
+    # căutare/filtrare rapidă.
+    if "Date Detaliate" in wb.sheetnames:
+        ws_dd = wb["Date Detaliate"]
+        if ws_dd.max_row >= 1:
+            for _c in range(1, ws_dd.max_column + 1):
+                _hdr_dd = ws_dd.cell(1, _c).value
+                if isinstance(_hdr_dd, str) and _hdr_dd.strip().lower() in ("data_ora", "timestamp"):
+                    ws_dd.column_dimensions[get_column_letter(_c)].width = 18
+            ws_dd.auto_filter.ref = ws_dd.dimensions
+            ws_dd.freeze_panes = "B2"  # fixează rândul 1 (antet) și coloana A (timestamp)
 
     df = df.copy()  # defragmentare DataFrame (evită PerformanceWarning)
     df['Data'] = pd.to_datetime(df['Data_Ora'], format='%d.%m.%Y %H:%M')
@@ -1135,8 +1151,13 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             return 0
 
     lunar_data = []
+    # Snapshot pre-override al fiecărei luni CALCULATE (întotdeauna toate, de la
+    # zero) — folosit mai jos la scrierea în trafic_mzl, ca valorile salvate să
+    # fie cele calculate automat, nu cele mutate de blocul de override manual.
+    _mzl_snapshot = []
     for _, row in toate_lunile.iterrows():
         an, luna = row['An'], row['Luna']
+
         df_luna_valida = df_valid[(df_valid['An'] == an) & (df_valid['Luna'] == luna)]
         nr_zile_valide = df_luna_valida['Zi'].nunique() if len(df_luna_valida) > 0 else 0
         zile_in_luna   = calendar.monthrange(an, luna)[1]
@@ -1174,6 +1195,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             #   - sume_cls_c: doar zilele clasificator
             #     → proporții reale cls 1-8 (fără cls15 în numitor)
             sume_total = 0
+            sume_total_s1 = 0   # media zilnică pe sensuri — doar Total, nu și pe clase
+            sume_total_s2 = 0
             sume_cls_all = {f'Clasa_{i}': 0 for i in range(1, 9)}
             sume_cls_all['Clasa_15'] = 0
             n_zile_total = 0
@@ -1205,6 +1228,11 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 sume_total += total_zi
                 n_zile_total += 1
 
+                # Sens 1 / Sens 2 — split pe aceeași sumă reconstruită (SENS1_B/SENS2_B
+                # sunt exact aceleași grupuri de benzi folosite la foaia Date prelucrate)
+                sume_total_s1 += sum(_otot_zi.get(_b, 0) for _b in SENS1_B)
+                sume_total_s2 += sum(_otot_zi.get(_b, 0) for _b in SENS2_B)
+
                 for _cls_i in list(range(1, 9)) + [15]:
                     _val = sum(_ocls_zi.get(_b, {}).get(_cls_i, 0) for _b in band_ids)
                     sume_cls_all[f'Clasa_{_cls_i}'] += _val
@@ -1223,6 +1251,10 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
                 # MZL Total = media totalurilor din toate zilele valide (C + T)
                 mzl_total = round(sume_total / n_zile_total)
+
+                # MZL pe sensuri (doar Total, nu și pe clase) — aceeași bază de calcul
+                mzl_sens1 = round(sume_total_s1 / n_zile_total)
+                mzl_sens2 = round(sume_total_s2 / n_zile_total)
 
                 # Medii de bază cls 1-8 și cls15 din toate zilele
                 medii_all = {
@@ -1270,15 +1302,20 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
                 # Total garantat consistent
                 medii['Total'] = mzl_total
+                medii['Sens1'] = mzl_sens1
+                medii['Sens2'] = mzl_sens2
 
             else:
 
                 medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
                 medii['Clasa_15'] = 0
                 medii['Total'] = 0
+                medii['Sens1'] = 0
+                medii['Sens2'] = 0
         else:
             medii = {f'Clasa_{i}': 0 for i in range(1, 9)}
             medii['Clasa_15'] = 0; medii['Total'] = 0
+            medii['Sens1'] = 0; medii['Sens2'] = 0
         an, luna = row['An'], row['Luna']
         df_luna_valida = df_valid[(df_valid['An'] == an) & (df_valid['Luna'] == luna)]
         # Mod funcționare lunar = tipul zilei majoritar din Date prelucrate
@@ -1295,14 +1332,19 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         else:
             mod_functionare_lunar = 'clasificator'
 
-        lunar_data.append({
+        _new_entry = {
             'Post': site_id, 'An': an, 'Luna': luna,
             **medii, 'Indicator': indicator, 'Color': color,
             'Zile_cu_inregistrari': f"{nr_zile_valide}/{zile_in_luna}",
             'Are_date_valide': (divisor > 0),
             'Mod_functionare': mod_functionare_lunar,
             'MZL_Calculat': medii.get('Total', 0),  # valoarea auto ÎNAINTE de override manual
-        })
+        }
+        lunar_data.append(_new_entry)
+        # Snapshot pre-override — folosit la salvarea în trafic_mzl mai jos,
+        # ca să nu pierdem repartiția pe clase/indicator/color reale odată ce
+        # blocul de suprascrieri manuale (mai jos) mută entry['Total'] etc.
+        _mzl_snapshot.append(dict(_new_entry))
 
     # ── Aplică suprascrierile manuale ─────────────────────────────────────────
     for entry in lunar_data:
@@ -1315,46 +1357,60 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 ratio = mzl_m / old_total
                 for cls in [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']:
                     entry[cls] = round(entry.get(cls, 0) * ratio)
+                entry['Sens1'] = round(entry.get('Sens1', 0) * ratio)
+                entry['Sens2'] = round(entry.get('Sens2', 0) * ratio)
             else:
                 # Nu există date calculate — punem tot în Total, clase 0
                 for cls in [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']:
                     entry[cls] = 0
+                entry['Sens1'] = 0
+                entry['Sens2'] = 0
             entry['Total']    = mzl_m
             entry['Color']    = 'MANUAL'
             entry['Indicator'] = f"Prelucrare manuală (MZL={mzl_m})"
 
     # ── Salvăm MZL în trafic_mzl (tabel dedicat, separat de mzl_manual) ─────────
     # mzl_calculat = valoarea calculată automat din Date prelucrate (înainte de override).
-    # mzl_final    = valoarea efectivă din raport (după override manual dacă există).
+    # mzl_final    = valoarea efectivă din raport (după override manual dacă există, citit
+    #                din _manual_overrides mai jos).
     # mzl_manual   rămâne neatins — conține doar corecțiile introduse manual din GUI.
+    #
+    # Se recalculează și se rescrie ÎNTOTDEAUNA tot istoricul contorului, la
+    # fiecare generare de raport — fără nicio verificare de cache.
     try:
         from database import get_traffic_db as _get_tdb_save
         _tdb_save = _get_tdb_save()
-        # Construim un dict {(an, luna): mzl_calculat} ÎNAINTE de suprascrieri manuale
-        # lunar_data_calculat e deja disponibil mai sus (înainte de blocul de overrides);
-        # folosim câmpul 'MZL_Calculat' pe care îl adăugăm mai jos în append.
-        for _entry in lunar_data:
-            _mzl_final     = _entry.get('Total', 0) or 0
-            _mzl_calculat  = _entry.get('MZL_Calculat', _mzl_final)  # salvat înainte de override
-            _este_manual   = 1 if _entry.get('Color') == 'MANUAL' else 0
-            _indicator     = _entry.get('Indicator', '')
-            # Extragem nr_zile_valide și zile_luna din câmpul 'Zile_cu_inregistrari' (ex: "28/31")
-            _zile_str      = _entry.get('Zile_cu_inregistrari', '0/0')
+        for _entry in _mzl_snapshot:
+            _an_e, _luna_e = int(_entry['An']), int(_entry['Luna'])
+            _mzl_calculat  = _entry.get('MZL_Calculat', _entry.get('Total', 0)) or 0
+            # mzl_final = valoarea finală din raport, adică include override manual
+            # dacă există pentru (an, luna) — verificăm direct în _manual_overrides.
+            _override_key = (_an_e, _luna_e)
+            _mzl_final = (round(_manual_overrides[_override_key])
+                          if _override_key in _manual_overrides else _mzl_calculat)
+            _este_manual = 1 if _override_key in _manual_overrides else 0
+            _zile_str    = _entry.get('Zile_cu_inregistrari', '0/0')
             try:
                 _zv, _zl = [int(x) for x in str(_zile_str).split('/')]
             except Exception:
                 _zv, _zl = 0, 0
-            # Salvăm toate lunile (inclusiv cele cu Total=0 — pot fi relevante ca absență de date)
+            _clase_snapshot = {f'Clasa_{i}': _entry.get(f'Clasa_{i}', 0) for i in range(1, 9)}
+            _clase_snapshot['Clasa_15'] = _entry.get('Clasa_15', 0)
             _tdb_save.upsert_trafic_mzl(
                 contor=str(site_id),
-                an=int(_entry['An']),
-                luna=int(_entry['Luna']),
+                an=_an_e,
+                luna=_luna_e,
                 mzl_calculat=float(_mzl_calculat),
                 mzl_final=float(_mzl_final),
                 este_manual=_este_manual,
-                indicator=_indicator,
+                indicator=_entry.get('Indicator', ''),
                 zile_valide=_zv,
                 zile_luna=_zl,
+                clase=_clase_snapshot,
+                sens1=_entry.get('Sens1', 0),
+                sens2=_entry.get('Sens2', 0),
+                mod_functionare=_entry.get('Mod_functionare', ''),
+                color=_entry.get('Color', ''),
             )
     except Exception as _e_mzl_save:
         print(f"[WARN] Nu s-a putut salva trafic_mzl pentru {site_id}: {_e_mzl_save}")
@@ -1362,7 +1418,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     # headers_lunar definit ÎNAINTE de merge_cells care îl folosește
     headers_lunar = ["Post","An","Luna","Clasa 1","Clasa 2","Clasa 3","Clasa 4",
                      "Clasa 5","Clasa 6","Clasa 7","Clasa 8","Clasa 15",
-                     "Total","Indicator","Mod de funcționare","Zile cu înregistrări"]
+                     "Total","Sens 1","Sens 2","Indicator","Mod de funcționare","Zile cu înregistrări"]
 
     ws_lunar.merge_cells(f"A1:{get_column_letter(len(headers_lunar))}1")
     ws_lunar["A1"] = (f"MEDIE ZILNICĂ LUNARĂ  |  Contor: {site_id}"
@@ -1396,15 +1452,15 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         vals = [rd['Post'], rd['An'], luna_nume[rd['Luna']],
                 rd['Clasa_1'], rd['Clasa_2'], rd['Clasa_3'], rd['Clasa_4'],
                 rd['Clasa_5'], rd['Clasa_6'], rd['Clasa_7'], rd['Clasa_8'],
-                rd['Clasa_15'], rd['Total'], rd['Indicator'],
+                rd['Clasa_15'], rd['Total'], rd['Sens1'], rd['Sens2'], rd['Indicator'],
                 rd.get('Mod_functionare', '').capitalize(),
                 rd['Zile_cu_inregistrari']]
         for c, val in enumerate(vals, 1):
             cell = ws_lunar.cell(dr_lunar, c, val)
             cell.font = dfont(9); cell.fill = rf; cell.border = brd
-            # cols 1-3=text centrat, 4-13=numere dreapta, 14+=text centrat
-            cell.alignment = ctr() if c <= 3 or c >= 14 else rgt()
-            if 4 <= c <= 13:
+            # cols 1-3=text centrat, 4-15=numere dreapta (Clase+Total+Sens1+Sens2), 16+=text centrat
+            cell.alignment = ctr() if c <= 3 or c >= 16 else rgt()
+            if 4 <= c <= 15:
                 cell.number_format = '#,##0'
         dr_lunar += 1
 
@@ -1461,20 +1517,37 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         df_valide = df_an[df_an['Are_date_valide'] == True]
         n_luni_val = len(df_valide)
 
-        clase_cols_mza = [f'Clasa_{i}' for i in range(1, 9)] + ['Clasa_15']
+
+        # ── Mod de funcționare anual = tipul majoritar din LUNILE anului ──────────
+        # Aceeași logică ca la tabelul 1 (unde luna preia tipul de zi majoritar),
+        # aplicată acum la nivel de an: se numără toate lunile anului (indiferent
+        # dacă sunt "valide" pentru MZL) după 'Mod_functionare' deja calculat în
+        # tabelul 1, și câștigă tipul cu cele mai multe luni.
+        _tip_counts_an = {'clasificator': 0, 'totalizator': 0, 'null': 0}
+        for _mf in df_an['Mod_functionare']:
+            _mf_key = str(_mf).strip().lower()
+            _tip_counts_an[_mf_key] = _tip_counts_an.get(_mf_key, 0) + 1
+        if sum(_tip_counts_an.values()) > 0:
+            mod_mza = max(_tip_counts_an, key=_tip_counts_an.get).capitalize()
+        else:
+            mod_mza = "—"
+
+        _mza_clase_din_fallback = False  # True dacă clasele au fost copiate direct din Mai/Oct
 
         if n_luni_val >= _MIN_LUNI_AN:
             # Calcul normal: media pe luni valide
             medii_mza = {}
-            for col in clase_cols_mza:
-                if col in df_valide.columns:
-                    medii_mza[col] = round(df_valide[col].sum() / n_luni_val)
-                else:
-                    medii_mza[col] = 0
-            medii_mza['Total'] = sum(medii_mza.values())
+            # Total = media directă a Total-urilor lunare reale (NU suma claselor mediate).
+            # Diferă de sumă atunci când o lună are 0 zile clasificator — clasele acelei
+            # luni sunt forțate la 0 în tabelul MZL (nedeterminabile), deși Total-ul ei
+            # rămâne calculat corect din zilele totalizator. Media directă evită
+            # subestimarea MZA în astfel de cazuri.
+            medii_mza['Total'] = round(df_valide['Total'].sum() / n_luni_val)
+            # Sens 1 / Sens 2 — adăugate DUPĂ calculul Total (nu intră în suma claselor)
+            medii_mza['Sens1'] = round(df_valide['Sens1'].sum() / n_luni_val) if 'Sens1' in df_valide.columns else 0
+            medii_mza['Sens2'] = round(df_valide['Sens2'].sum() / n_luni_val) if 'Sens2' in df_valide.columns else 0
             indicator_mza = f"MZA normală ({n_luni_val} luni)"
             color_mza     = C_MZA_NORM
-            mod_mza       = "Clasificator"
 
         else:
             # Fallback 1: luna Mai
@@ -1483,12 +1556,20 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
             if not df_mai_valid.empty:
                 medii_mza = {}
-                for col in clase_cols_mza:
-                    medii_mza[col] = int(df_mai_valid.iloc[0].get(col, 0))
-                medii_mza['Total'] = sum(medii_mza.values())
+                _row_fallback = df_mai_valid.iloc[0]
+                # Total = valoarea reală a lunii Mai (copiată direct), nu suma claselor —
+                # vezi motivul mai sus (clase 0 posibile cu Total nenul).
+                medii_mza['Total'] = int(_row_fallback.get('Total', 0))
+                medii_mza['Sens1'] = int(_row_fallback.get('Sens1', 0))
+                medii_mza['Sens2'] = int(_row_fallback.get('Sens2', 0))
+                # Clasele se preiau ȘI ele integral din luna Mai (fără ponderare pe an) —
+                # fallback-ul copiază luna completă, nu doar Total-ul.
+                for _i in range(1, 9):
+                    medii_mza[f'Clasa_{_i}'] = int(_row_fallback.get(f'Clasa_{_i}', 0))
+                medii_mza['Clasa_15'] = int(_row_fallback.get('Clasa_15', 0))
                 indicator_mza = f"Fallback Mai ({n_luni_val} luni valide)"
                 color_mza     = C_MZA_FALL
-                mod_mza       = df_mai_valid.iloc[0].get('Mod_functionare', 'clasificator').capitalize()
+                _mza_clase_din_fallback = True
             else:
                 # Fallback 2: luna Octombrie
                 df_oct = df_an[df_an['Luna'] == _MIN_LUNI_AN_OCT]
@@ -1496,19 +1577,96 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
                 if not df_oct_valid.empty:
                     medii_mza = {}
-                    for col in clase_cols_mza:
-                        medii_mza[col] = int(df_oct_valid.iloc[0].get(col, 0))
-                    medii_mza['Total'] = sum(medii_mza.values())
+                    _row_fallback = df_oct_valid.iloc[0]
+                    # Total = valoarea reală a lunii Octombrie (copiată direct), nu suma
+                    # claselor — acesta era bug-ul: Octombrie putea avea clase 0 (nicio
+                    # zi clasificator) dar Total nenul, iar suma claselor arăta 0.
+                    medii_mza['Total'] = int(_row_fallback.get('Total', 0))
+                    medii_mza['Sens1'] = int(_row_fallback.get('Sens1', 0))
+                    medii_mza['Sens2'] = int(_row_fallback.get('Sens2', 0))
+                    # Clasele se preiau ȘI ele integral din luna Octombrie (fără ponderare
+                    # pe an) — la fel ca la fallback-ul Mai.
+                    for _i in range(1, 9):
+                        medii_mza[f'Clasa_{_i}'] = int(_row_fallback.get(f'Clasa_{_i}', 0))
+                    medii_mza['Clasa_15'] = int(_row_fallback.get('Clasa_15', 0))
                     indicator_mza = f"Fallback Octombrie ({n_luni_val} luni valide)"
                     color_mza     = C_MZA_FALL
-                    mod_mza       = df_oct_valid.iloc[0].get('Mod_functionare', 'clasificator').capitalize()
+                    _mza_clase_din_fallback = True
                 else:
                     # Fără date suficiente
-                    medii_mza     = {col: 0 for col in clase_cols_mza}
+                    medii_mza     = {}
                     medii_mza['Total'] = 0
+                    medii_mza['Sens1'] = 0
+                    medii_mza['Sens2'] = 0
                     indicator_mza = f"Insuficient ({n_luni_val} luni valide)"
                     color_mza     = C_MZA_NULL
                     mod_mza       = "—"
+
+        # ── Distribuție pe clase — proporții din LUNILE anului care au date pe clase ──
+        # Aceeași idee ca la tabelul 1 (unde Clasa_15 dintr-o lună se redistribuie
+        # proporțional cu structura zilelor clasificator ale acelei luni), aplicată
+        # acum la nivel de an: proporțiile fiecărei clase se calculează doar din
+        # lunile valide ale anului care AU date pe clase (adică au avut cel puțin
+        # o zi clasificator — vezi n_zile_c la tabelul 1), apoi se aplică la
+        # Total-ul anual deja calculat mai sus (indiferent de ramura folosită).
+        # Clasa cu ponderea cea mai mică absoarbe restul de rotunjire, garantând
+        # suma claselor == Total exact, la fel ca la tabelul 1.
+        if _mza_clase_din_fallback:
+            # Clasele au fost deja copiate integral din luna Mai/Octombrie (mai sus) —
+            # nu se mai recalculează prin ponderare pe lunile anului. La cererea
+            # utilizatorului, fallback-ul preia luna de fallback "cu tot cu repartiția
+            # pe clase", nu doar Total-ul ponderat pe clasele altor luni ale anului.
+            pass
+        else:
+            clase_1_8 = [f'Clasa_{i}' for i in range(1, 9)]
+            _luni_cu_clase = df_valide[df_valide[clase_1_8].sum(axis=1) > 0] if not df_valide.empty else df_valide
+
+            _mza_total_val = medii_mza.get('Total', 0)
+            if not _luni_cu_clase.empty and _mza_total_val > 0:
+                sum_cls_luni = {i: int(_luni_cu_clase[f'Clasa_{i}'].sum()) for i in range(1, 9)}
+                total_c_fara15_an = sum(sum_cls_luni.values())
+                if total_c_fara15_an > 0:
+                    prop = {i: sum_cls_luni[i] / total_c_fara15_an for i in range(1, 9)}
+                    cls_sortate = sorted(range(1, 9), key=lambda i: prop[i], reverse=True)
+                    atribuit = 0
+                    for idx, i in enumerate(cls_sortate):
+                        if idx == len(cls_sortate) - 1:
+                            medii_mza[f'Clasa_{i}'] = max(0, _mza_total_val - atribuit)
+                        else:
+                            v = round(prop[i] * _mza_total_val)
+                            medii_mza[f'Clasa_{i}'] = v
+                            atribuit += v
+                else:
+                    for i in range(1, 9):
+                        medii_mza[f'Clasa_{i}'] = 0
+            else:
+                # Nicio lună a anului cu date pe clase — nedeterminabile (ca la tabelul 1)
+                for i in range(1, 9):
+                    medii_mza[f'Clasa_{i}'] = 0
+            medii_mza['Clasa_15'] = 0
+
+        # ── Salvăm MZA în trafic_mza ──────────────────────────────────────────
+        # Persistăm rezultatul recalculat de mai sus, ca alte unelte (hartă,
+        # centralizator, alte scripturi) să poată citi MZA direct din SQLite
+        # fără să regenereze raportul Excel complet.
+        try:
+            from database import get_traffic_db as _get_tdb_mza
+            _tdb_mza = _get_tdb_mza()
+            _mza_clase = {f'Clasa_{i}': medii_mza.get(f'Clasa_{i}', 0) for i in range(1, 9)}
+            _mza_clase['Clasa_15'] = medii_mza.get('Clasa_15', 0)
+            _tdb_mza.upsert_trafic_mza(
+                contor=str(site_id),
+                an=int(an_mza),
+                clase=_mza_clase,
+                total=medii_mza.get('Total', 0),
+                sens1=medii_mza.get('Sens1', 0),
+                sens2=medii_mza.get('Sens2', 0),
+                indicator=indicator_mza,
+                mod_functionare=mod_mza,
+                luni_valide=int(n_luni_val),
+            )
+        except Exception as _e_mza_save:
+            print(f"[WARN] Nu s-a putut salva trafic_mza pentru {site_id}/{an_mza}: {_e_mza_save}")
 
         rf_mza = fill(color_mza)
         vals_mza = [
@@ -1518,6 +1676,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             medii_mza.get('Clasa_5',0), medii_mza.get('Clasa_6',0),
             medii_mza.get('Clasa_7',0), medii_mza.get('Clasa_8',0),
             medii_mza.get('Clasa_15',0), medii_mza.get('Total',0),
+            medii_mza.get('Sens1',0), medii_mza.get('Sens2',0),
             indicator_mza, mod_mza, f"{n_luni_val}/12 luni",
         ]
         for c_i, val in enumerate(vals_mza, 1):
@@ -1525,14 +1684,14 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             _c.font      = dfont(9, bold=True)
             _c.fill      = rf_mza
             _c.border    = brd
-            _c.alignment = ctr() if c_i <= 3 or c_i >= 14 else rgt()
-            if 4 <= c_i <= 13 and isinstance(val, int):
+            _c.alignment = ctr() if c_i <= 3 or c_i >= 16 else rgt()
+            if 4 <= c_i <= 15 and isinstance(val, int):
                 _c.number_format = '#,##0'
         ws_lunar.row_dimensions[dr_sep].height = 22
         dr_sep += 1
 
     # Lățimi coloane — actualizate pentru noile coloane
-    widths_lunar = [10, 8, 8] + [10] * 9 + [12, 20, 18, 16]
+    widths_lunar = [10, 8, 8] + [10] * 9 + [12, 12, 12] + [20, 18, 16]
     for c, w in enumerate(widths_lunar, 1):
         ws_lunar.column_dimensions[get_column_letter(c)].width = w
 
@@ -1554,9 +1713,12 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         r_idx = start_chart_row + luna_nr
         ws_lunar.cell(r_idx, 1, luna_nome_full[luna_nr - 1])
         for idx_an, an in enumerate(ani_unici, 2):
-            row_v   = lunar_df[(lunar_df['An'] == an) & (lunar_df['Luna'] == luna_nr)]
-            valoare = int(row_v.iloc[0]['Total']) if len(row_v) > 0 else 0
-            ws_lunar.cell(r_idx, idx_an, valoare).number_format = '#,##0'
+            row_v = lunar_df[(lunar_df['An'] == an) & (lunar_df['Luna'] == luna_nr)]
+            if len(row_v) > 0 and bool(row_v.iloc[0]['Are_date_valide']):
+                valoare = int(row_v.iloc[0]['Total'])
+                ws_lunar.cell(r_idx, idx_an, valoare).number_format = '#,##0'
+            else:
+                ws_lunar.cell(r_idx, idx_an, None)  # gol, nu 0 — graficul arata gol real
 
     cats_l = Reference(ws_lunar, min_col=1, min_row=start_chart_row+1, max_row=start_chart_row+12)
     data_l = Reference(ws_lunar, min_col=2, max_col=1+len(ani_unici),
@@ -1570,7 +1732,10 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     chart_lunar.x_axis.delete = False; chart_lunar.y_axis.delete = False
     chart_lunar.legend.position = 'b'; chart_lunar.legend.overlay = False
     chart_lunar.x_axis.axPos = "b"; chart_lunar.x_axis.tickLblPos = "nextTo"
-    chart_lunar.x_axis.textRotation = -45000
+    chart_lunar.x_axis.txPr = RichText(
+        bodyPr=RichTextProperties(rot=-2700000, vert="horz"),  # -45 grade = -45*60000
+        p=[Paragraph(pPr=ParagraphProperties(defRPr=CharacterProperties(sz=900)),
+                     endParaRPr=CharacterProperties(sz=900))])
     chart_lunar.y_axis.scaling.min = 0
     chart_lunar.y_axis.title = "Număr vehicule"
     chart_lunar.layout = Layout(manualLayout=ManualLayout(x=0.1, y=0.12, h=0.7, w=0.85,
@@ -1582,7 +1747,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         serie.smooth = True; serie.marker.symbol = "circle"; serie.marker.size = 7
         serie.marker.graphicalProperties.solidFill = culori_ani[idx % len(culori_ani)]
         serie.marker.graphicalProperties.line.solidFill = culori_ani[idx % len(culori_ani)]
-    ws_lunar.add_chart(chart_lunar, "Q3")
+    ws_lunar.add_chart(chart_lunar, f"{get_column_letter(n_cols_lunar + 1)}3")
 
     # ── FOAIE 4: Profil Orar Mediu ───────────────────────────────────────────
     ws3 = wb.create_sheet("Profil Orar Mediu")
@@ -2095,17 +2260,102 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
             ("Zi neutilizabilă", "ambele D", "sens lipsă",
              "Dacă nu se poate reconstitui cel puțin un sens → ziua e marcată Neutilizabil "
              "și exclusă din MZL și MZA."),
-            # ── Secțiunea 3: MZA ────────────────────────────────────────────
-            ("─── MZA ───", "", "", ""),
-            ("Minim luni valide / an", _MIN_LUNI_AN, "luni",
-             f"MZA = medie aritmetică a MZL-urilor lunilor valide, dacă sunt cel puțin "
-             f"{_MIN_LUNI_AN} luni valide din an. MZL = media zilnică a datelor prelucrate."),
-            ("Fallback MZA — luna Mai", f"luna {_MIN_LUNI_AN_MAI}", "Mai",
-             f"Dacă sunt sub {_MIN_LUNI_AN} luni valide, MZA = valoarea MZL a lunii Mai "
-             f"(luna {_MIN_LUNI_AN_MAI}), dacă aceasta este validă."),
-            ("Fallback MZA — luna Octombrie", f"luna {_MIN_LUNI_AN_OCT}", "Octombrie",
-             f"Dacă nici luna Mai nu e validă, MZA = valoarea MZL a lunii Octombrie "
-             f"(luna {_MIN_LUNI_AN_OCT}). Dacă nici Octombrie nu e validă → MZA lipsă."),
+            # ── Secțiunea 3: MZL — calcul Total (toate cazurile) ─────────────
+            ("─── MZL — CALCUL TOTAL (Media Zilnică Lunară) ───", "", "", ""),
+            ("Formulă generală", "Σ Total_zi / n_zile_valide", "vehicule/zi",
+             "Media aritmetică a totalurilor zilnice (C+T reconstruite, din foaia "
+             "„Date prelucrate”) pe toate zilele valide ale lunii (≥ MIN_ORE_ZI ore/zi)."),
+            ("Caz: date complete", "n_zile_valide = zile_în_lună", "",
+             "Toate zilele calendaristice ale lunii sunt valide — media se face pe "
+             "numărul total de zile din lună (ex. 30 sau 31)."),
+            ("Caz: date parțiale", f"≥{MIN_ZILE_LUNA} zile valide", "",
+             "Cel puțin MIN_ZILE_LUNA zile valide, dar nu toate — media se face doar "
+             "pe zilele valide existente, nu pe toată luna."),
+            ("Caz: fallback 7 zile", f"{MIN_ZILE_SAPT} zile consecutive", "",
+             "Sub pragul minim de zile/lună, dar există ≥7 zile consecutive valide — "
+             "MZL Total = suma acelor 7 zile / 7."),
+            ("Caz: nicio zi validă", "—", "",
+             "Luna nu apare deloc în tabelul MZL (exclusă complet din MZL și din MZA)."),
+            # ── Secțiunea 4: MZL — repartiție pe clase (toate cazurile) ──────
+            ("─── MZL — REPARTIȚIE PE CLASE (toate cazurile) ───", "", "", ""),
+            ("Sursă proporții", "doar zilele Clasificator (C)", "",
+             "Proporția fiecărei clase (1-8) se calculează exclusiv din zilele de tip "
+             "Clasificator ale lunii — zilele Totalizator nu au clase reale detectate, "
+             "traficul lor e contabilizat doar la Clasa_15 (nedeterminate)."),
+            ("Caz: cel puțin 1 zi Clasificator", "vezi formulă", "%",
+             "Pas 1: medie brută/clasă pe TOATE zilele valide (inclusiv totalizator, "
+             "unde clasele reale sunt 0). Pas 2: proporția fiecărei clase se calculează "
+             "doar din zilele Clasificator: prop_i = Σcls_i(zile C) / Σcls_1..8(zile C). "
+             "Pas 3: Clasa_15 medie/zi se redistribuie proporțional: "
+             "Clasa_i final = medie_brută_i + round(prop_i × Clasa_15_medie/zi)."),
+            ("Ultima clasă (rotunjire)", "Total − Σ(celelalte 7 clase)", "vehicule",
+             "Clasa cu ponderea (prop_i) cea mai mică nu se calculează prin formulă — "
+             "primește diferența rămasă, ca suma celor 8 clase să fie exact = Total."),
+            ("Caz: 0 zile Clasificator (100% Totalizator)", "toate clasele = 0", "vehicule",
+             "Dacă luna nu are nicio zi Clasificator, structura pe clase e nedeterminabilă "
+             "— Clasele 1-15 rămân 0, dar Total rămâne calculat normal (din zilele Totalizator)."),
+            ("Suprascriere manuală MZL (cu date)", "ratio = MZL_manual / MZL_calculat", "",
+             "Dacă utilizatorul suprascrie manual Total-ul unei luni (din GUI), toate "
+             "clasele — inclusiv Sens 1 / Sens 2 — sunt scalate proporțional cu acest "
+             "raport, ca suma să rămână exact = noul Total introdus manual."),
+            ("Suprascriere manuală MZL (fără date)", "clase = 0", "",
+             "Dacă luna suprascrisă manual nu avea niciun Total calculat anterior (0), "
+             "clasele rămân 0 — tot Total-ul manual e necunoscut pe structura de clase."),
+            # ── Secțiunea 5: MZA — calcul Total (toate cazurile) ─────────────
+            ("─── MZA — CALCUL TOTAL (Media Zilnică Anuală) ───", "", "", ""),
+            ("Prag luni valide / an", _MIN_LUNI_AN, "luni",
+             f"MZA se calculează „normal” dacă anul are cel puțin {_MIN_LUNI_AN} luni "
+             f"valide (Are_date_valide = True în tabelul MZL)."),
+            ("Caz: normal (≥ prag luni)", "Σ Total_lunar_valid / n_luni_valide", "vehicule/zi",
+             "Media aritmetică directă a coloanei Total din tabelul MZL, peste toate "
+             "lunile valide ale anului — NU suma claselor mediate (poate diferi dacă "
+             "vreo lună are clase 0 dar Total nenul, vezi secțiunea MZL de mai sus)."),
+            ("Caz: fallback — luna Mai", f"luna {_MIN_LUNI_AN_MAI}", "Mai",
+             f"Dacă anul are sub {_MIN_LUNI_AN} luni valide, MZA Total = valoarea reală "
+             f"MZL a lunii Mai (copiată direct din tabelul MZL), dacă Mai e validă."),
+            ("Caz: fallback — luna Octombrie", f"luna {_MIN_LUNI_AN_OCT}", "Octombrie",
+             "Dacă nici luna Mai nu e validă, MZA Total = valoarea reală MZL a lunii "
+             "Octombrie, copiată direct din tabelul MZL."),
+            ("Caz: insuficient", "0", "",
+             "Dacă nici Mai, nici Octombrie nu au date valide → MZA Total = 0, "
+             "indicator „Insuficient”."),
+            # ── Secțiunea 6: MZA — repartiție pe clase (toate cazurile) ──────
+            ("─── MZA — REPARTIȚIE PE CLASE (toate cazurile) ───", "", "", ""),
+            ("Caz: normal (≥ prag luni)", "lunile valide ale anului", "",
+             "Proporția fiecărei clase se calculează din lunile VALIDE ale anului care "
+             "au avut cel puțin o zi Clasificator (deci au clase ≠ 0 în tabelul MZL), "
+             "apoi se aplică la Total-ul anual: prop_i = Σ Clasa_i (lunile cu date) / "
+             "Σ Clasa_1..8 (lunile cu date); Clasa_i = round(prop_i × MZA_Total)."),
+            ("Ultima clasă (rotunjire, caz normal)", "MZA_Total − Σ(celelalte 7 clase)", "vehicule",
+             "La fel ca la MZL — clasa cu ponderea cea mai mică absoarbe diferența de "
+             "rotunjire, garantând suma exactă = MZA Total."),
+            ("Caz: nicio lună cu date pe clase (caz normal)", "toate clasele = 0", "vehicule",
+             "Dacă nicio lună validă a anului nu are structură pe clase cunoscută, "
+             "MZA rămâne cu clasele nedeterminabile (0), chiar dacă Total e nenul."),
+            ("Caz: fallback (Mai sau Octombrie)", "clase copiate direct din luna de fallback", "",
+             "NU se mai ponderează pe lunile anului: Clasa_1..8 și Clasa_15 se preiau "
+             "integral din tabelul MZL al lunii Mai (sau Octombrie, dacă Mai nu e "
+             "validă) — aceeași lună folosită și pentru Total, Sens 1 și Sens 2."),
+            # ── Secțiunea 7: Mod de funcționare (vot majoritar) ───────────────
+            ("─── MOD DE FUNCȚIONARE (Clasificator / Totalizator) ───", "", "", ""),
+            ("Nivel lunar (tabel MZL)", "tip majoritar din zilele lunii", "",
+             "Se numără zilele lunii după tip (Clasificator / Totalizator / Neutilizabil) "
+             "— câștigă tipul cu cele mai multe zile. La egalitate exactă, câștigă Clasificator."),
+            ("Nivel anual (tabel MZA)", "tip majoritar din lunile anului", "",
+             "Se numără lunile anului după „Mod de funcționare” deja calculat la nivel "
+             "lunar (indiferent dacă luna e sau nu „validă” pentru MZL) — câștigă tipul "
+             "cu cele mai multe luni, aceeași regulă de egalitate ca la nivel lunar."),
+            # ── Secțiunea 8: Sens 1 / Sens 2 ──────────────────────────────────
+            ("─── SENS 1 / SENS 2 (Total pe sensuri) ───", "", "", ""),
+            ("MZL Sens 1 / Sens 2", "Σ Total_sens_zi / n_zile_valide", "vehicule/zi",
+             "Aceeași bază de calcul ca MZL Total, dar suma zilnică se face doar pe "
+             "benzile grupului Sens 1, respectiv Sens 2 — Sens 1 + Sens 2 = Total, mereu, exact."),
+            ("MZA Sens 1 / Sens 2 (normal)", "Σ Sens_lunar_valid / n_luni_valide", "vehicule/zi",
+             "Media directă a coloanelor Sens 1 / Sens 2 din tabelul MZL, peste lunile "
+             "valide ale anului — aceeași metodă ca la MZA Total."),
+            ("MZA Sens 1 / Sens 2 (fallback)", "valoare lună Mai/Octombrie", "",
+             "Copiate direct din luna de fallback folosită pentru Total (Mai sau "
+             "Octombrie), la fel ca Total."),
         ]
         # Scriem rândurile de reguli
         row_reguli = 3

@@ -6,6 +6,10 @@
   <title>Hartă Contoare — CESTRIN</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <!-- MapLibre GL (randare fundal vector OpenFreeMap, stil Positron, fără API key) -->
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet"/>
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.0/leaflet-maplibre-gl.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f1f5f9;
@@ -230,10 +234,10 @@ let map         = null;
 function initMap() {
   map = L.map("map", { center:[45.9432,24.9668], zoom:7, zoomControl:false });
   L.control.zoom({ position:"bottomright" }).addTo(map);
-  L.tileLayer(
-    "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-    { attribution:"© OpenStreetMap © CARTO", maxZoom:19 }
-  ).addTo(map);
+  L.maplibreGL({
+    style: "https://tiles.openfreemap.org/styles/positron",
+    attribution: "© OpenStreetMap contributors © OpenFreeMap"
+  }).addTo(map);
   document.getElementById("loading-overlay").style.display = "none";
 }
 

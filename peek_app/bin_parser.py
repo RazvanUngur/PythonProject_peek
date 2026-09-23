@@ -2,7 +2,9 @@
 # bin_parser.py — Parsare fișiere .bin PEEK/Sabre
 # =============================================================================
 # Exportă:
-#   process_peek_bin(filepath)   → (df, site_id, start_date, n_lanes)
+#   process_peek_bin(filepath, warning_callback=None)   → (df, site_id, start_date, n_lanes)
+#       warning_callback(msg: str) — opțional, apelat pentru fiecare avertisment
+#       (ex. valoare implauzibilă / oră neutralizată), în plus față de print().
 #   quick_scan_bin(filepath)     → (site_id, n_records, n_lanes)
 #   process_multiple_files(...)  → [{ path, id, randuri, b1, b2, n_lanes }, ...]
 # =============================================================================
@@ -21,7 +23,36 @@ from config import (
 from excel_report import add_charts_and_formatting
 from database import get_traffic_db
 
-def process_peek_bin(filepath):
+
+def _remap_clase_ro08_la_ro23(clase_ro08):
+    """
+    Comasează un vector de 15 clase din clasificarea veche RO08 (validă până
+    în 2023, clase reale 1-13 + clasa 15 = neclasificate) în schema curentă
+    RO23 (8 clase + clasa 15), aplicată de aplicație/DB/Excel din 2023:
+
+        RO23_1 .. RO23_5 = RO08_1 .. RO08_5      (neschimbate)
+        RO23_6           = RO08_6 + RO08_7 + RO08_13
+        RO23_7           = RO08_8 + RO08_9 + RO08_10 + RO08_11
+        RO23_8           = RO08_12
+        RO23_15          = RO08_15                (neclasificate, neschimbată)
+
+    Clasa RO08_14 nu se folosește niciodată (mereu 0 în formatul vechi) și e
+    ignorată — nu se adaugă nicăieri.
+
+    `clase_ro08`: listă de 15 valori (index 0 = Clasa_1 ... index 14 = Clasa_15).
+    Returnează o listă nouă de 15 valori (pozițiile 9-14, index 8-13, sunt 0).
+    """
+    c = list(clase_ro08) + [0] * (15 - len(clase_ro08))  # gardă defensivă
+    out = [0] * 15
+    out[0:5] = c[0:5]                        # Clasa 1-5
+    out[5]   = c[5] + c[6] + c[12]           # Clasa 6 = RO08 6+7+13
+    out[6]   = c[7] + c[8] + c[9] + c[10]    # Clasa 7 = RO08 8+9+10+11
+    out[7]   = c[11]                         # Clasa 8 = RO08 12
+    out[14]  = c[14]                         # Clasa 15 neschimbată
+    return out
+
+
+def process_peek_bin(filepath, warning_callback=None):
     """
     Parsează un fișier .bin PEEK/Sabre și returnează (df, site_id, start_date, n_lanes).
 
@@ -78,7 +109,23 @@ def process_peek_bin(filepath):
     current_date = datetime(year_start, month_start, day_start, hour_start, 0)
 
     # ── Detectare număr benzi din header RO23 ────────────────────────────────
-    pos_ro23 = raw.find(b'RO23')
+    # Folosim ULTIMA apariție a header-ului RO23, nu prima.
+    # Motiv: contoarele pot re-scrie complet sesiunea de logging în caz de
+    # eveniment (cădere tensiune, resetare, scriere întreruptă) — header-ul
+    # RO23 apare din nou în mijlocul fișierului, urmat de o nouă copie
+    # (corectă) a datelor de la începutul sesiunii. Copia dinaintea ultimului
+    # header poate fi parțial coruptă (un octet cu bit-ul 0x80 setat greșit
+    # dezaliniază tot decodorul varint după acel punct). Verificat pe caz real:
+    # ancorarea pe ultimul RO23 recuperează exact valorile din raportul sursă
+    # (VIPER), inclusiv pentru orele afectate de corupție.
+    _ro23_positions = [m.start() for m in re.finditer(b'RO23', raw)]
+    if len(_ro23_positions) > 1:
+        print(f"  ⚠ [{os.path.basename(filepath)}] {len(_ro23_positions)} header-e RO23 "
+              f"găsite în fișier (posibil re-inițializare/resetare contor) — "
+              f"folosesc ultima copie de date (offset {_ro23_positions[-1]}), "
+              f"ignor {_ro23_positions[-1] - _ro23_positions[0]} octeți anteriori "
+              f"(posibil corupți).")
+    pos_ro23 = raw.rfind(b'RO23')
     if pos_ro23 >= 0:
         raw_lanes = raw[pos_ro23 + 11] // 2      # 4→2, 8→4, 12→6
         n_lanes   = raw_lanes if raw_lanes in (2, 4, 6) else 2
@@ -86,11 +133,357 @@ def process_peek_bin(filepath):
         n_lanes = 2
     start_pos = (pos_ro23 + 68) if pos_ro23 >= 0 else 68
 
+    # ── Gardă de siguranță — număr real de benzi ─────────────────────────────
+    # Imediat după codul contorului (string ASCII terminat cu \x00) există un
+    # byte care indică DIRECT numărul de benzi fizice ale contorului —
+    # verificat pe fișiere reale (2 benzi × 2 cazuri, 8 benzi × 1 caz),
+    # coincide exact cu TOPS de fiecare dată. E un semnal independent de
+    # euristica `pos_ro23+11 // 2` de mai sus (gândită doar pt. formatul
+    # clasic 2/4/6 benzi) și mult mai direct.
+    #
+    # Îl folosim STRICT ca gardă: dacă indică clar un număr de benzi pe care
+    # aplicația NU îl suportă (DB/Excel au coloane doar pt. 2/4/6 benzi),
+    # oprim parsarea în loc să continuăm cu n_lanes greșit și să inventăm
+    # valori dintr-un flux de octeți decodat cu stride greșit. Nu schimbă
+    # NIMIC pentru fișierele 2/4/6 benzi deja funcționale — garda nu se
+    # activează dacă nu găsește un match clar sau dacă valoarea e deja în
+    # (2, 4, 6).
+    try:
+        _lane_guard = re.search(
+            rb'0{4,}' + re.escape(site_id.encode()) + rb'\x00(.)', raw)
+        if _lane_guard:
+            _benzi_reale = _lane_guard.group(1)[0]
+            if _benzi_reale not in (2, 4, 6):
+                print(f"  ⚠ [{os.path.basename(filepath)}] Contor {site_id}: "
+                      f"header indică {_benzi_reale} benzi fizice — aplicația "
+                      f"suportă doar 2/4/6 benzi. Fișier IGNORAT complet (nu se "
+                      f"generează nicio valoare), ca să nu invente date dintr-o "
+                      f"decodare cu număr de benzi greșit.")
+                return pd.DataFrame(), site_id, current_date, 0
+    except Exception:
+        pass  # gardă best-effort — dacă eșuează, continuăm ca înainte
+
     # ── Format Ro04R (simplificat, mereu 2 benzi) ────────────────────────────
     is_ro04r = (raw.find(b'Ro04R') != -1) and (pos_ro23 == -1)
 
-    if is_ro04r:
-        # Decodare specifică Ro04R: totaluri simple per bandă
+    # ── Format totalizator 2 benzi cu header RO23 "scurt" ────────────────────
+    # Contoare setate ca TOTALIZATOR (nu clasificator) care totuși folosesc
+    # header-ul RO23: preambulul dinaintea datelor orare NU mai conține tabelul
+    # de praguri de clasificare (14 clase), deci e mult mai scurt decât cel
+    # presupus de `start_pos = pos_ro23 + 68` (valabil doar pt. clasificatoare).
+    # Structura per record (verificat byte-cu-byte pe caz real):
+    #   [oră_sfârșit(1B)] [B1 varint] [B2 varint] [B1_dup varint] [B2_dup varint] [0x00 terminator]
+    # Găsim offset-ul real prin scanare: încercăm o fereastră de offset-uri
+    # candidate imediat după "RO23" și păstrăm pe cel care produce cel mai lung
+    # șir de recorduri valide (oră 0-23, terminator 0x00, valoare == duplicat).
+    def _decode_val_tot(data, i):
+        b = data[i]
+        if b >= 128:
+            if i + 1 < len(data):
+                return (b & 0x7F) * 256 + data[i + 1], i + 2
+            return None, i + 1
+        return b, i + 1
+
+    def _scan_totalizator_2b(raw, search_from, search_range=120, min_run=24):
+        # Semnalul de validare NU e potrivirea B1/B2 cu duplicatul lor (contorul
+        # poate avea zgomot/corupție punctuală pe acele câmpuri — vezi cazul
+        # cu un record de index corupt la începutul fluxului), ci faptul că
+        # ora înregistrării crește strict cu 1 (mod 24) de la un record la altul,
+        # exact ca la celelalte formate totalizator deja tratate în acest fișier
+        # (_detect_tot_v6, _detect_sabre etc.). O potrivire lungă de duplicate
+        # poate apărea accidental pe un offset greșit; o secvență orară
+        # consistentă pe zeci de recorduri nu poate fi coincidență.
+        best_start, best_run = None, 0
+        limit = min(search_from + search_range, len(raw))
+        for cand in range(search_from, limit):
+            pos, run, prev_h = cand, 0, None
+            while pos < len(raw) - 2 and run < 3000:
+                h = raw[pos]
+                if h > 23:
+                    break
+                p = pos + 1
+                b1, p = _decode_val_tot(raw, p)
+                if b1 is None: break
+                b2, p = _decode_val_tot(raw, p)
+                if b2 is None: break
+                _b1d, p = _decode_val_tot(raw, p)
+                if _b1d is None: break
+                _b2d, p = _decode_val_tot(raw, p)
+                if _b2d is None: break
+                if p >= len(raw) or raw[p] != 0x00:
+                    break
+                if prev_h is not None and h != (prev_h + 1) % 24:
+                    break
+                prev_h = h
+                run += 1
+                pos = p + 1
+            if run > best_run:
+                best_run, best_start = run, cand
+        return best_start if best_run >= min_run else None
+
+    # ── Format RO08 (clasificare veche 1-13 + clasa 15, valabilă până în 2023) ─
+    # Contoarele configurate cu clasificarea RO08 NU au marcajul text "RO23"
+    # în header — au în loc "RO08" la un alt offset din preambul, motiv
+    # pentru care până acum aceste fișiere cădeau pe decodarea implicită
+    # (greșită) de 2 benzi. Structura per record e variabilă (varint, cu
+    # terminator 0x00), cu totalurile pe bandă stocate EXPLICIT înaintea
+    # claselor. Acoperim aceleași cazuri ca la RO23 — 2/4/6 benzi (clasificator
+    # complet) și totalizator (fără repartiție pe clase) — folosind offsetul
+    # RO08 în loc de RO23:
+    #   Clasificator (N benzi):
+    #     [oră_sfârșit(1B)] [Total_B1..Total_BN varint ×N]
+    #     [B1_Clasa_1..15 varint ×15] .. [BN_Clasa_1..15 varint ×15] [0x00]
+    #   Totalizator (2 benzi, aceeași structură ca la RO23):
+    #     [oră_sfârșit(1B)] [B1] [B2] [B1_dup] [B2_dup] [0x00]
+    # Cazul clasificator 2 benzi e verificat byte-cu-byte pe fișier real
+    # (contor 2204, 21.06.2022): valorile decodate coincid exact, oră cu oră,
+    # cu raportul TOPS sursă (392/418 la 14:00, 437/371 la 15:00 etc.).
+    # Variantele 4/6 benzi și totalizator nu au încă un fișier de test propriu
+    # — sunt extrapolate prin analogie cu structura confirmată la 2 benzi și
+    # cu formatul totalizator deja folosit la RO23, dar rămân protejate de
+    # aceeași validare strictă prin scanare (mai jos), deci nu se activează
+    # decât dacă chiar validează structural pe fișierul respectiv.
+    def _decode_val_ro08(data, i):
+        if i >= len(data):
+            return None, i
+        b = data[i]
+        if b >= 128:
+            if i + 1 < len(data):
+                return (b & 0x7F) * 256 + data[i + 1], i + 2
+            return None, i + 1
+        return b, i + 1
+
+    def _consume_ro08_terminator(raw, p, n_lanes_):
+        # De regulă terminatorul 0x00 vine imediat după ultima clasă a
+        # ultimei benzi. Unele contoare (verificat pe fișier real) repetă
+        # ÎNCĂ O DATĂ totalurile pe bandă după cele n_lanes×15 clase — pare o
+        # validare redundantă la nivel de hardware — înainte de terminator.
+        # Acceptăm ambele variante; returnăm poziția de după terminator, sau
+        # None dacă niciuna nu validează.
+        if p < len(raw) and raw[p] == 0x00:
+            return p + 1
+        q = p
+        for _ in range(n_lanes_):
+            v, q = _decode_val_ro08(raw, q)
+            if v is None:
+                return None
+        if q < len(raw) and raw[q] == 0x00:
+            return q + 1
+        return None
+
+    def _scan_ro08_clasificator_nb(raw, search_from, n_lanes_cand,
+                                    search_range=200, min_run=8):
+        # Validare (ca să nu agățăm accidental un offset greșit):
+        # (a) ora crește strict cu 1 (mod 24) de la un record la altul,
+        # (b) toate cele n_lanes_cand×(1+15) valori varint + terminatorul
+        #     0x00 decodează fără erori, pe multe ore consecutive (min_run).
+        # NU validăm totalul stocat față de suma claselor — verificat pe mai
+        # multe fișiere reale, diferența poate fi 0 (contor 2204/1015), mică
+        # (contor 8301) sau mare, pe alocuri (contor 1111) — total nesigur ca
+        # semnal. Validarea structurală de mai sus e oricum extrem de
+        # puternică: pe fișier real, offsetul corect a dat un run complet
+        # (sute de ore), iar orice offset greșit s-a rupt după 1-2 ore.
+        best_start, best_run = None, 0
+        limit = min(search_from + search_range, len(raw))
+        for cand in range(search_from, limit):
+            pos, run, prev_h = cand, 0, None
+            while pos < len(raw) - 2 and run < 5000:
+                h = raw[pos]
+                if h > 23:
+                    break
+                p = pos + 1
+                totals, ok = [], True
+                for _ in range(n_lanes_cand):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    totals.append(v)
+                if not ok: break
+                bands, ok = [], True
+                for _ in range(n_lanes_cand):
+                    cls, ok2 = [], True
+                    for _ in range(15):
+                        v, p = _decode_val_ro08(raw, p)
+                        if v is None: ok2 = False; break
+                        cls.append(v)
+                    if not ok2: ok = False; break
+                    bands.append(cls)
+                if not ok: break
+                new_p = _consume_ro08_terminator(raw, p, n_lanes_cand)
+                if new_p is None:
+                    break
+                if prev_h is not None and h != (prev_h + 1) % 24:
+                    break
+                prev_h = h
+                run += 1
+                pos = new_p
+            if run > best_run:
+                best_run, best_start = run, cand
+        return best_start if best_run >= min_run else None
+
+    pos_ro08 = raw.rfind(b'RO08') if (pos_ro23 == -1 and not is_ro04r) else -1
+    ro08_scan_start      = None
+    ro08_n_lanes         = None
+    ro08_is_totalizator  = False
+    if pos_ro08 >= 0:
+        # Clasificator complet — încercăm 2, 4, 6 benzi (validare mai tare,
+        # deci prioritate față de totalizator: verifică 15 clase/bandă).
+        for _n_cand in (2, 4, 6):
+            _start = _scan_ro08_clasificator_nb(raw, pos_ro08 + 9, _n_cand)
+            if _start is not None:
+                ro08_scan_start, ro08_n_lanes, ro08_is_totalizator = _start, _n_cand, False
+                break
+        # Totalizator (doar dacă niciun clasificator nu a validat)
+        if ro08_scan_start is None:
+            _tot_start = _scan_totalizator_2b(raw, pos_ro08 + 8)
+            if _tot_start is not None:
+                ro08_scan_start, ro08_n_lanes, ro08_is_totalizator = _tot_start, 2, True
+        if ro08_scan_start is None:
+            print(f"  ⚠ [{os.path.basename(filepath)}] Marcaj RO08 găsit dar nu am "
+                  f"putut localiza recordurile de date (clasificator 2/4/6 benzi "
+                  f"sau totalizator) — fișier procesat cu decodarea implicită.")
+    is_ro08 = ro08_scan_start is not None
+
+    tot_scan_start = None
+    if (not is_ro04r) and pos_ro23 >= 0 and n_lanes == 2:
+        tot_scan_start = _scan_totalizator_2b(raw, pos_ro23 + 8)
+    is_tot_scan = tot_scan_start is not None
+
+    if is_tot_scan:
+        # Decodare directă folosind offset-ul găsit prin scanare
+        pos = tot_scan_start
+        rows = []
+        while pos < len(raw) - 2:
+            hour_val = raw[pos]
+            if hour_val > 23:
+                break
+            p = pos + 1
+            tot_b1, p = _decode_val_tot(raw, p)
+            tot_b2, p = _decode_val_tot(raw, p)
+            _b1_dup, p = _decode_val_tot(raw, p)
+            _b2_dup, p = _decode_val_tot(raw, p)
+            if tot_b1 is None or tot_b2 is None:
+                break
+            if p >= len(raw) or raw[p] != 0x00:
+                break
+            pos = p + 1  # sărim peste terminator
+
+            c_b1 = [0] * 15; c_b1[14] = tot_b1
+            c_b2 = [0] * 15; c_b2[14] = tot_b2
+
+            if not rows:
+                timestamp = current_date.replace(hour=hour_val, minute=0) - timedelta(hours=1)
+            else:
+                timestamp = rows[-1]["Timestamp"] + timedelta(hours=1)
+
+            row = {"Contor": site_id, "Timestamp": timestamp,
+                   "Data_Ora": timestamp.strftime("%d.%m.%Y %H:%M"), "N_Benzi": 2}
+            for idx, val in enumerate(c_b1, 1): row[f"B1_Clasa_{idx}"] = val
+            row["Total_B1"] = tot_b1
+            for idx, val in enumerate(c_b2, 1): row[f"B2_Clasa_{idx}"] = val
+            row["Total_B2"] = tot_b2
+            for bn in range(3, 5):
+                for idx in range(1, 16): row[f"B{bn}_Clasa_{idx}"] = 0
+                row[f"Total_B{bn}"] = 0
+            row["Total_General"] = tot_b1 + tot_b2
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        n_lanes = 2
+
+    elif is_ro08:
+        # ── RO08: clasificare veche (1-13 + clasa 15) — 2/4/6 benzi sau
+        # totalizator, comasată direct la citire în schema curentă RO23
+        # (1-8 + clasa 15): 1-5 neschimbate, 6=RO08(6+7+13), 7=RO08(8+9+10+11),
+        # 8=RO08(12); clasa 14 (mereu 0 în RO08) e ignorată. Totalizator ⇒
+        # doar Clasa_15 (totalul orar), fără repartiție pe clase (ca la RO23).
+        pos = ro08_scan_start
+        rows = []
+        while pos < len(raw) - 2:
+            hour_val = raw[pos]
+            if hour_val > 23:
+                break
+            p = pos + 1
+
+            if ro08_is_totalizator:
+                b1, p = _decode_val_tot(raw, p)
+                b2, p = _decode_val_tot(raw, p)
+                _b1d, p = _decode_val_tot(raw, p)
+                _b2d, p = _decode_val_tot(raw, p)
+                if b1 is None or b2 is None:
+                    break
+                if p >= len(raw) or raw[p] != 0x00:
+                    break
+                pos = p + 1
+                totals = [b1, b2]
+                bands_final = [[0] * 15, [0] * 15]
+                bands_final[0][14] = b1
+                bands_final[1][14] = b2
+            else:
+                totals, ok = [], True
+                for _ in range(ro08_n_lanes):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    totals.append(v)
+                if not ok: break
+                bands_final, ok = [], True
+                for _ in range(ro08_n_lanes):
+                    cls, ok2 = [], True
+                    for _ in range(15):
+                        v, p = _decode_val_ro08(raw, p)
+                        if v is None: ok2 = False; break
+                        cls.append(v)
+                    if not ok2: ok = False; break
+                    bands_final.append(_remap_clase_ro08_la_ro23(cls))
+                if not ok: break
+                new_p = _consume_ro08_terminator(raw, p, ro08_n_lanes)
+                if new_p is None:
+                    break
+                pos = new_p
+
+                # Totalul pe bandă = suma celor 15 clase (exact ca "All Classes"
+                # din TOPS), nu valoarea brută stocată în fișier — pe fișierele
+                # cu 4 benzi, totalul brut de pe hardware poate diferi ușor de
+                # suma claselor (validat pe fișier real, contor 8301).
+                totals = [sum(band) for band in bands_final]
+
+            if not rows:
+                timestamp = current_date.replace(hour=hour_val, minute=0) - timedelta(hours=1)
+            else:
+                timestamp = rows[-1]["Timestamp"] + timedelta(hours=1)
+
+            row = {"Contor": site_id, "Timestamp": timestamp,
+                   "Data_Ora": timestamp.strftime("%d.%m.%Y %H:%M"), "N_Benzi": ro08_n_lanes}
+            total_general = 0
+            for b_idx, band in enumerate(bands_final, 1):
+                for cls_idx, val in enumerate(band, 1):
+                    row[f"B{b_idx}_Clasa_{cls_idx}"] = val
+                tot_b = totals[b_idx - 1]
+                row[f"Total_B{b_idx}"] = tot_b
+                total_general += tot_b
+            for b_idx in range(ro08_n_lanes + 1, 7):
+                for cls_idx in range(1, 16): row[f"B{b_idx}_Clasa_{cls_idx}"] = 0
+                row[f"Total_B{b_idx}"] = 0
+            row["Total_General"] = total_general
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        n_lanes = ro08_n_lanes
+
+    elif is_ro04r:
+        # Decodare Ro04R — structură completă, verificată byte-cu-byte pe caz real
+        # CU clasificare activă (nu doar totalizator):
+        #
+        #   [oră_sfârșit(1B)] [B1_total varint] [B2_total varint]
+        #   [B1_Clasa_1..15 varint ×15, sumă == B1_total]
+        #   [B2_Clasa_1..15 varint ×15, sumă == B2_total]
+        #   [0x00 terminator]
+        #
+        # (versiunea anterioară presupunea greșit 14 octeți de padding gol +
+        # un "duplicat" al totalului — asta mergea din întâmplare doar pentru
+        # contoare setate totalizator, unde clasele 1-14 chiar sunt 0 iar
+        # "duplicatul" era de fapt Clasa 15 = total. Pe un contor cu
+        # clasificare reală activă, acolo stau clasele reale, iar structura
+        # veche dezalinia tot fluxul după primele câteva ore.)
         def _decode_val_ro04r(data, i):
             b = data[i]
             if b >= 128:
@@ -100,27 +493,34 @@ def process_peek_bin(filepath):
             return b, i + 1
 
         ro04r_idx = raw.find(b'Ro04R')
-        pos = ro04r_idx + 14
+        pos = ro04r_idx + 68
         rows = []
-        while pos < len(raw):
-            b = raw[pos]
-            if b == 0x00:
-                pos += 1; continue
-            if b > 23:
-                pos += 1; continue
-            hour_val = b
-            pos += 1
-            vals = []
-            i = pos
-            for _ in range(4):
-                if i >= len(raw): break
-                v, i = _decode_val_ro04r(raw, i)
-                if v is not None: vals.append(v)
-            if len(vals) < 4: break
-            pos = i
-            tot_b1, tot_b2 = vals[0], vals[1]
-            c_b1 = [0] * 15; c_b1[14] = tot_b1
-            c_b2 = [0] * 15; c_b2[14] = tot_b2
+        while pos < len(raw) - 2:
+            hour_val = raw[pos]
+            if hour_val > 23:
+                break
+            p = pos + 1
+            try:
+                tot_b1, p = _decode_val_ro04r(raw, p)
+                tot_b2, p = _decode_val_ro04r(raw, p)
+                c_b1 = []
+                for _ in range(15):
+                    v, p = _decode_val_ro04r(raw, p)
+                    if v is None: raise TypeError
+                    c_b1.append(v)
+                c_b2 = []
+                for _ in range(15):
+                    v, p = _decode_val_ro04r(raw, p)
+                    if v is None: raise TypeError
+                    c_b2.append(v)
+            except (TypeError, IndexError):
+                break
+            if tot_b1 is None or tot_b2 is None:
+                break
+            if p >= len(raw) or raw[p] != 0x00:
+                # nu mai respectă structura de record -> oprim parsarea aici
+                break
+            pos = p + 1  # sărim peste terminator
 
             if not rows:
                 timestamp = current_date.replace(hour=hour_val, minute=0) - timedelta(hours=1)
@@ -700,6 +1100,32 @@ def process_peek_bin(filepath):
     if df.empty:
         return df, site_id, current_date, n_lanes
 
+    # ── Plasă de siguranță: valori implauzibile ──────────────────────────────
+    # Orice oră cu Total_General peste pragul de plauzibilitate este semn de
+    # date corupte (dezaliniere octeți / eroare de parsare) și e neutralizată
+    # (clase + totaluri → 0) în loc să polueze Excel-ul și centralizatorul cu
+    # cifre absurde. Rândul rămâne în serie (cu Total_General=0 și N_Benzi
+    # corect) pentru a nu decala cronologia orelor următoare.
+    MAX_TOTAL_ORAR = 10000  # vehicule/oră — peste acest prag = date corupte
+    if "Total_General" in df.columns:
+        suspect = df["Total_General"] > MAX_TOTAL_ORAR
+        n_suspect = int(suspect.sum())
+        if n_suspect:
+            band_cols = [c for c in df.columns
+                         if ("_Clasa_" in c) or c.startswith("Total_B")]
+            for _, r in df.loc[suspect].iterrows():
+                _msg_warn = (f"  ⚠ [{site_id}] Valoare implauzibilă la {r.get('Data_Ora', '?')}: "
+                             f"Total_General={r['Total_General']:.0f} (> {MAX_TOTAL_ORAR}) "
+                             f"— oră neutralizată (posibil date corupte în .bin).")
+                print(_msg_warn)
+                if warning_callback:
+                    try:
+                        warning_callback(_msg_warn)
+                    except Exception:
+                        pass
+            df.loc[suspect, band_cols] = 0
+            df.loc[suspect, "Total_General"] = 0
+
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df = df.set_index("Timestamp")
     df = df[~df.index.duplicated(keep="last")]
@@ -739,7 +1165,7 @@ def quick_scan_bin(filepath):
         n_records = 0
 
         # Detectare număr benzi din header RO23
-        pos_ro23 = data.find(b'RO23')
+        pos_ro23 = data.rfind(b'RO23')  # ultima apariție — vezi process_peek_bin()
         if pos_ro23 >= 0 and not is_ro04r:
             raw_lanes = data[pos_ro23 + 11] // 2
             n_lanes   = raw_lanes if raw_lanes in (2, 4, 6) else 2
@@ -798,10 +1224,12 @@ def quick_scan_bin(filepath):
 
 
 def process_multiple_files(filepaths, output_dir=None, stop_event=None,
-                           progress_callback=None):
+                           progress_callback=None, warning_callback=None):
     """
     progress_callback(site_id, n_ore, idx, total_contoare) — apelat după
     fiecare contor procesat și scris în SQLite + Excel.
+    warning_callback(msg) — apelat pentru fiecare avertisment de date
+    implauzibile (oră neutralizată), pentru afișare live în GUI.
     """
     contoare_data  = {}
     contoare_lanes = {}
@@ -811,7 +1239,8 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
         if stop_event and stop_event.is_set():
             return None   # anulat de utilizator
         try:
-            df, site_id, start_date, n_lanes = process_peek_bin(filepath)
+            df, site_id, start_date, n_lanes = process_peek_bin(
+                filepath, warning_callback=warning_callback)
             if df is None or df.empty:
                 continue
             if site_id not in contoare_data:

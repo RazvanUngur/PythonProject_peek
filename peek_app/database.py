@@ -156,6 +156,23 @@ CREATE TABLE IF NOT EXISTS trafic_mzl (
     zile_luna       INTEGER DEFAULT 0,
     calculat_la     TEXT    DEFAULT '',
 
+    -- Repartiție pe clase și sensuri a valorii CALCULATE automat (înainte de
+    -- eventualul override manual — override-ul se reaplică mereu la citire
+    -- din mzl_manual, ca să rămână mereu în sincron cu GUI-ul de corecții).
+    clasa_1         INTEGER DEFAULT 0,
+    clasa_2         INTEGER DEFAULT 0,
+    clasa_3         INTEGER DEFAULT 0,
+    clasa_4         INTEGER DEFAULT 0,
+    clasa_5         INTEGER DEFAULT 0,
+    clasa_6         INTEGER DEFAULT 0,
+    clasa_7         INTEGER DEFAULT 0,
+    clasa_8         INTEGER DEFAULT 0,
+    clasa_15        INTEGER DEFAULT 0,
+    sens1           INTEGER DEFAULT 0,
+    sens2           INTEGER DEFAULT 0,
+    mod_functionare TEXT    DEFAULT '',
+    color           TEXT    DEFAULT '',
+
     UNIQUE (contor, an, luna)
 );
 
@@ -163,6 +180,35 @@ CREATE INDEX IF NOT EXISTS idx_trafic_mzl_contor
     ON trafic_mzl (contor);
 CREATE INDEX IF NOT EXISTS idx_trafic_mzl_contor_an
     ON trafic_mzl (contor, an);
+
+CREATE TABLE IF NOT EXISTS trafic_mza (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    contor          TEXT    NOT NULL,
+    an              INTEGER NOT NULL,
+
+    clasa_1         INTEGER DEFAULT 0,
+    clasa_2         INTEGER DEFAULT 0,
+    clasa_3         INTEGER DEFAULT 0,
+    clasa_4         INTEGER DEFAULT 0,
+    clasa_5         INTEGER DEFAULT 0,
+    clasa_6         INTEGER DEFAULT 0,
+    clasa_7         INTEGER DEFAULT 0,
+    clasa_8         INTEGER DEFAULT 0,
+    clasa_15        INTEGER DEFAULT 0,
+    total           INTEGER DEFAULT 0,
+    sens1           INTEGER DEFAULT 0,
+    sens2           INTEGER DEFAULT 0,
+
+    indicator       TEXT    DEFAULT '',   -- "MZA normală (9 luni)" / fallback Mai / etc.
+    mod_functionare TEXT    DEFAULT '',
+    luni_valide     INTEGER DEFAULT 0,
+    calculat_la     TEXT    DEFAULT '',
+
+    UNIQUE (contor, an)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trafic_mza_contor
+    ON trafic_mza (contor);
 
 CREATE TABLE IF NOT EXISTS fisiere_procesate (
     cale_fisier     TEXT    PRIMARY KEY,
@@ -262,6 +308,19 @@ class TrafficDB:
             if "perioada_max" not in cols:
                 conn.execute(
                     "ALTER TABLE fisiere_procesate ADD COLUMN perioada_max TEXT DEFAULT ''")
+
+            mzl_cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(trafic_mzl)").fetchall()}
+            _mzl_new_cols = (
+                [f"clasa_{i}" for i in range(1, 9)] + ["clasa_15", "sens1", "sens2"]
+                + ["mod_functionare", "color"]
+            )
+            for _col in _mzl_new_cols:
+                if _col not in mzl_cols:
+                    _type = "TEXT DEFAULT ''" if _col in ("mod_functionare", "color") \
+                        else "INTEGER DEFAULT 0"
+                    conn.execute(f"ALTER TABLE trafic_mzl ADD COLUMN {_col} {_type}")
+
             conn.commit()
         except Exception:
             pass  # migrare best-effort; nu blocăm pornirea aplicației
@@ -608,19 +667,29 @@ class TrafficDB:
     def upsert_trafic_mzl(self, contor: str, an: int, luna: int,
                            mzl_calculat: float, mzl_final: float,
                            este_manual: int = 0, indicator: str = "",
-                           zile_valide: int = 0, zile_luna: int = 0) -> None:
+                           zile_valide: int = 0, zile_luna: int = 0,
+                           clase: dict = None, sens1: float = 0, sens2: float = 0,
+                           mod_functionare: str = "", color: str = "") -> None:
         """
-        Inserează/actualizează MZL final în trafic_mzl.
+        Inserează/actualizează MZL final în trafic_mzl — inclusiv repartiția pe
+        clase/sensuri.
+
         mzl_calculat = valoarea calculată automat din Date prelucrate (înainte de override manual).
         mzl_final    = valoarea folosită efectiv în raport (după override manual dacă există).
         este_manual  = 1 dacă mzl_final provine din mzl_manual, 0 dacă e calculat automat.
+        clase        = dict {'Clasa_1': v, ..., 'Clasa_15': v} — repartiția valorii calculate.
         """
+        clase = clase or {}
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._execute_with_retry("""
             INSERT INTO trafic_mzl
                 (contor, an, luna, mzl_calculat, mzl_final,
-                 este_manual, indicator, zile_valide, zile_luna, calculat_la)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 este_manual, indicator, zile_valide, zile_luna, calculat_la,
+                 clasa_1, clasa_2, clasa_3, clasa_4, clasa_5, clasa_6, clasa_7, clasa_8, clasa_15,
+                 sens1, sens2, mod_functionare, color)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?)
             ON CONFLICT(contor, an, luna) DO UPDATE SET
                 mzl_calculat = excluded.mzl_calculat,
                 mzl_final    = excluded.mzl_final,
@@ -628,9 +697,21 @@ class TrafficDB:
                 indicator    = excluded.indicator,
                 zile_valide  = excluded.zile_valide,
                 zile_luna    = excluded.zile_luna,
-                calculat_la  = excluded.calculat_la
+                calculat_la  = excluded.calculat_la,
+                clasa_1 = excluded.clasa_1, clasa_2 = excluded.clasa_2,
+                clasa_3 = excluded.clasa_3, clasa_4 = excluded.clasa_4,
+                clasa_5 = excluded.clasa_5, clasa_6 = excluded.clasa_6,
+                clasa_7 = excluded.clasa_7, clasa_8 = excluded.clasa_8,
+                clasa_15 = excluded.clasa_15,
+                sens1 = excluded.sens1, sens2 = excluded.sens2,
+                mod_functionare = excluded.mod_functionare,
+                color = excluded.color
         """, (contor, an, luna, mzl_calculat, mzl_final,
-               este_manual, indicator, zile_valide, zile_luna, now))
+               este_manual, indicator, zile_valide, zile_luna, now,
+               clase.get('Clasa_1', 0), clase.get('Clasa_2', 0), clase.get('Clasa_3', 0),
+               clase.get('Clasa_4', 0), clase.get('Clasa_5', 0), clase.get('Clasa_6', 0),
+               clase.get('Clasa_7', 0), clase.get('Clasa_8', 0), clase.get('Clasa_15', 0),
+               sens1, sens2, mod_functionare, color))
 
     def get_trafic_mzl(self, contor: str, an: int = None) -> pd.DataFrame:
         """Returnează DataFrame cu MZL final pentru un contor, opțional filtrat pe an."""
@@ -648,6 +729,62 @@ class TrafficDB:
             "SELECT * FROM trafic_mzl ORDER BY contor, an, luna",
             self._conn()
         )
+
+    # ── trafic_mza ────────────────────────────────────────────────────────────
+
+    def upsert_trafic_mza(self, contor: str, an: int, clase: dict,
+                           total: float, sens1: float = 0, sens2: float = 0,
+                           indicator: str = "", mod_functionare: str = "",
+                           luni_valide: int = 0) -> None:
+        """Inserează/actualizează MZA (Media Zilnică Anuală) pentru (contor, an)."""
+        clase = clase or {}
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._execute_with_retry("""
+            INSERT INTO trafic_mza
+                (contor, an, clasa_1, clasa_2, clasa_3, clasa_4, clasa_5, clasa_6,
+                 clasa_7, clasa_8, clasa_15, total, sens1, sens2,
+                 indicator, mod_functionare, luni_valide, calculat_la)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(contor, an) DO UPDATE SET
+                clasa_1 = excluded.clasa_1, clasa_2 = excluded.clasa_2,
+                clasa_3 = excluded.clasa_3, clasa_4 = excluded.clasa_4,
+                clasa_5 = excluded.clasa_5, clasa_6 = excluded.clasa_6,
+                clasa_7 = excluded.clasa_7, clasa_8 = excluded.clasa_8,
+                clasa_15 = excluded.clasa_15,
+                total = excluded.total, sens1 = excluded.sens1, sens2 = excluded.sens2,
+                indicator = excluded.indicator, mod_functionare = excluded.mod_functionare,
+                luni_valide = excluded.luni_valide,
+                calculat_la = excluded.calculat_la
+        """, (contor, an, clase.get('Clasa_1', 0), clase.get('Clasa_2', 0),
+               clase.get('Clasa_3', 0), clase.get('Clasa_4', 0), clase.get('Clasa_5', 0),
+               clase.get('Clasa_6', 0), clase.get('Clasa_7', 0), clase.get('Clasa_8', 0),
+               clase.get('Clasa_15', 0), total, sens1, sens2, indicator, mod_functionare,
+               luni_valide, now))
+
+    def get_trafic_mza(self, contor: str, an: int = None) -> pd.DataFrame:
+        """Returnează DataFrame cu MZA pentru un contor, opțional filtrat pe an."""
+        params = [contor]
+        where  = "contor = ?"
+        if an is not None:
+            where += " AND an = ?"; params.append(an)
+        return pd.read_sql_query(
+            f"SELECT * FROM trafic_mza WHERE {where} ORDER BY an",
+            self._conn(), params=params
+        )
+
+    def get_trafic_mza_row(self, contor: str, an: int) -> dict | None:
+        row = self._conn().execute(
+            "SELECT * FROM trafic_mza WHERE contor = ? AND an = ?",
+            (contor, an)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_trafic_mza(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM trafic_mza ORDER BY contor, an",
+            self._conn()
+        )
+
 
     # ── Statistici ────────────────────────────────────────────────────────────
 
@@ -736,8 +873,6 @@ class ContoareDB:
                     raise
         raise sqlite3.OperationalError(
             f"DB locked dupa {retries} incercari: {last_err}")
-
-
 
     def get_all(self) -> dict:
         """Returnează dict {contor: {Drum, Pozitie_km, Localitate, Tip, IP, x, y, lat, lng}}"""

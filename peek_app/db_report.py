@@ -4,6 +4,8 @@
 # Exportă:
 #   generate_report_from_db(contor, an, output_dir) → path Excel
 #   generate_all_reports_from_db(output_dir, an)    → list rezultate
+#   get_mzl_fast(contor, an=None)                   → DataFrame MZL din DB
+#   get_mza_fast(contor, an=None)                   → DataFrame MZA din DB
 # =============================================================================
 
 import os
@@ -13,6 +15,22 @@ from database import get_traffic_db, get_contoare_db
 from excel_report import add_charts_and_formatting
 from centralizator import update_centralizator
 from config import CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME
+
+
+def get_mzl_fast(contor: str, an: int = None) -> pd.DataFrame:
+    """
+    Citește MZL direct din trafic_mzl, FĂRĂ să regenereze raportul Excel.
+    Util pentru hartă, centralizator sau alte unelte care au nevoie doar de
+    valorile finale, nu de fișierul Excel complet.
+    """
+    tdb = get_traffic_db()
+    return tdb.get_trafic_mzl(str(contor), an=an)
+
+
+def get_mza_fast(contor: str, an: int = None) -> pd.DataFrame:
+    """Citește MZA direct din trafic_mza, fără să regenereze raportul Excel."""
+    tdb = get_traffic_db()
+    return tdb.get_trafic_mza(str(contor), an=an)
 
 
 def generate_report_from_db(contor: str, an: int = None,

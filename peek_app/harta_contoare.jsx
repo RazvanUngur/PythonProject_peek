@@ -12,19 +12,35 @@ const STATUS_CFG = {
   NELOCALIZAT:  { label: "Nelocalizat",      color: "#374151", fill: "#9ca3af", ring: "#6b7280" },
 };
 
-// ── Leaflet loader ────────────────────────────────────────────────────────────
+// ── Leaflet + MapLibre GL loader ───────────────────────────────────────────────
+// Încarcă Leaflet, apoi MapLibre GL JS și puntea leaflet-maplibre-gl (necesare
+// pentru fundalul OpenFreeMap „Positron” — vector, gratuit, fără API key).
+function loadCss(href) {
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = href;
+  document.head.appendChild(link);
+}
+function loadScript(src) {
+  return new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    document.head.appendChild(s);
+  });
+}
 function useLeaflet() {
-  const [ready, setReady] = useState(!!window.L);
+  const [ready, setReady] = useState(!!(window.L && window.L.maplibreGL));
   useEffect(() => {
-    if (window.L) { setReady(true); return; }
-    const css = document.createElement("link");
-    css.rel = "stylesheet";
-    css.href = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";
-    document.head.appendChild(css);
-    const script = document.createElement("script");
-    script.src = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";
-    script.onload = () => setReady(true);
-    document.head.appendChild(script);
+    if (window.L && window.L.maplibreGL) { setReady(true); return; }
+    (async () => {
+      loadCss("https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css");
+      await loadScript("https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js");
+      loadCss("https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css");
+      await loadScript("https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js");
+      await loadScript("https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.0/leaflet-maplibre-gl.js");
+      setReady(true);
+    })();
   }, []);
   return ready;
 }
@@ -186,10 +202,10 @@ export default function HartaContoare() {
       center: [45.9432, 24.9668], zoom: 7, zoomControl: false,
     });
     L.control.zoom({ position: "bottomright" }).addTo(map);
-    L.tileLayer(
-      "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-      { attribution: "© OpenStreetMap © CARTO", maxZoom: 19 }
-    ).addTo(map);
+    L.maplibreGL({
+      style: "https://tiles.openfreemap.org/styles/positron",
+      attribution: "© OpenStreetMap contributors © OpenFreeMap",
+    }).addTo(map);
     mapInst.current = map;
     return () => { map.remove(); mapInst.current = null; };
   }, [leafletReady]);

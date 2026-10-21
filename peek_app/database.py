@@ -31,6 +31,33 @@ _traffic_instance  = None
 _contoare_instance = None
 _lock = threading.Lock()
 
+# ── Redirecționare temporară a bazei trafic.db (sincronizare locală) ──────────
+# Folosit de db_sync.py: cât timp e setat, get_traffic_db() întoarce o
+# instanță conectată la fișierul indicat (o copie locală), nu la calea de
+# rețea implicită. NU afectează contoare.db.
+_traffic_db_path_override = None
+
+
+def set_traffic_db_path(path):
+    """Redirecționează get_traffic_db() către `path` (ex. o copie locală).
+    Instanța curentă (dacă există) e închisă întâi."""
+    global _traffic_db_path_override, _traffic_instance
+    with _lock:
+        if _traffic_instance is not None:
+            _traffic_instance.close()
+            _traffic_instance = None
+        _traffic_db_path_override = path
+
+
+def clear_traffic_db_path():
+    """Revine la calea implicită (rețea). Instanța curentă e închisă întâi."""
+    global _traffic_db_path_override, _traffic_instance
+    with _lock:
+        if _traffic_instance is not None:
+            _traffic_instance.close()
+            _traffic_instance = None
+        _traffic_db_path_override = None
+
 # =============================================================================
 # SCHEMA — trafic.db
 # =============================================================================
@@ -874,10 +901,17 @@ class ContoareDB:
         raise sqlite3.OperationalError(
             f"DB locked dupa {retries} incercari: {last_err}")
 
-    def get_all(self) -> dict:
-        """Returnează dict {contor: {Drum, Pozitie_km, Localitate, Tip, IP, x, y, lat, lng}}"""
+    def get_all(self, include_inactive: bool = False) -> dict:
+        """
+        Returnează dict {contor: {Drum, Pozitie_km, Localitate, Tip, IP, x, y,
+        lat, lng, DRDP, Activ}}.
+        Implicit doar contoarele ACTIVE (activ=1) — așa le văd harta și restul
+        aplicațiilor. include_inactive=True returnează toate (folosit de
+        fereastra Gestionare Contoare, ca să poți re-activa un contor).
+        """
+        where = "" if include_inactive else "WHERE COALESCE(activ, 1) = 1"
         rows = self._conn().execute(
-            "SELECT * FROM contoare WHERE activ = 1 ORDER BY contor"
+            f"SELECT * FROM contoare {where} ORDER BY contor"
         ).fetchall()
         return {
             r["contor"]: {
@@ -891,9 +925,25 @@ class ContoareDB:
                 "lat":        r["lat"],
                 "lng":        r["lng"],
                 "DRDP":       r["drdp"] if r["drdp"] is not None else "",
+                "Activ":      0 if r["activ"] == 0 else 1,
             }
             for r in rows
         }
+
+    def get_inactive(self) -> set:
+        """Setul de contoare marcate inactive (activ=0)."""
+        rows = self._conn().execute(
+            "SELECT contor FROM contoare WHERE activ = 0"
+        ).fetchall()
+        return {r["contor"] for r in rows}
+
+    def set_activ(self, contor: str, activ: bool) -> None:
+        """Marchează un contor activ/inactiv (cu retry la lock SQLite)."""
+        self._execute_with_retry(
+            "UPDATE contoare SET activ=?, modificat_la=? WHERE contor=?",
+            (1 if activ else 0,
+             datetime.now().isoformat(timespec="seconds"), contor)
+        )
 
     def get(self, contor: str) -> dict:
         row = self._conn().execute(
@@ -912,6 +962,7 @@ class ContoareDB:
             "lat":        row["lat"],
             "lng":        row["lng"],
             "DRDP":       row["drdp"] if row["drdp"] is not None else "",
+            "Activ":      0 if row["activ"] == 0 else 1,
         }
 
     def upsert(self, contor: str, data: dict) -> None:
@@ -923,7 +974,8 @@ class ContoareDB:
             self._execute_with_retry("""
                 UPDATE contoare
                 SET drum=?, pozitie_km=?, localitate=?, tip=?, ip=?,
-                    x=?, y=?, lat=?, lng=?, drdp=?, modificat_la=?, activ=1
+                    x=?, y=?, lat=?, lng=?, drdp=?, modificat_la=?,
+                    activ=COALESCE(?, activ)
                 WHERE contor=?
             """, (
                 data.get("Drum", ""), data.get("Pozitie_km", ""),
@@ -932,14 +984,16 @@ class ContoareDB:
                 data.get("x"), data.get("y"),
                 data.get("lat"), data.get("lng"),
                 data.get("DRDP", ""),
-                now, contor
+                now,
+                (None if data.get("Activ") is None else (1 if data.get("Activ") else 0)),
+                contor
             ))
         else:
             self._execute_with_retry("""
                 INSERT INTO contoare
                 (contor, drum, pozitie_km, localitate, tip, ip,
                  x, y, lat, lng, drdp, activ, adaugat_la, modificat_la)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 contor, data.get("Drum", ""), data.get("Pozitie_km", ""),
                 data.get("Localitate", ""), data.get("Tip", ""),
@@ -947,6 +1001,7 @@ class ContoareDB:
                 data.get("x"), data.get("y"),
                 data.get("lat"), data.get("lng"),
                 data.get("DRDP", ""),
+                (0 if data.get("Activ") in (0, False, "0") else 1),
                 now, now
             ))
 
@@ -956,10 +1011,14 @@ class ContoareDB:
             self.upsert(contor, data)
 
     def delete(self, contor: str) -> None:
-        """Soft delete cu retry."""
+        """
+        Ștergere REALĂ din contoare.db (cu retry).
+        Coloana `activ` nu mai înseamnă „șters”, ci „contor în funcțiune /
+        afișat pe hartă” — pentru a-l scoate temporar de pe hartă folosește
+        set_activ(contor, False), nu delete().
+        """
         self._execute_with_retry(
-            "UPDATE contoare SET activ=0, modificat_la=? WHERE contor=?",
-            (datetime.now().isoformat(timespec="seconds"), contor)
+            "DELETE FROM contoare WHERE contor=?", (contor,)
         )
 
     def get_localitate(self, contor: str) -> str:
@@ -971,7 +1030,7 @@ class ContoareDB:
     def get_as_dataframe(self) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT contor, drum, pozitie_km, localitate, tip, ip, drdp "
-            "FROM contoare WHERE activ=1 ORDER BY contor",
+            "FROM contoare WHERE COALESCE(activ, 1)=1 ORDER BY contor",
             self._conn()
         )
 
@@ -994,10 +1053,13 @@ class ContoareDB:
 
 def get_traffic_db() -> TrafficDB:
     global _traffic_instance
-    if _traffic_instance is None:
+    target = _traffic_db_path_override or TRAFFIC_DB
+    if _traffic_instance is None or _traffic_instance.db_path != target:
         with _lock:
-            if _traffic_instance is None:
-                _traffic_instance = TrafficDB()
+            if _traffic_instance is None or _traffic_instance.db_path != target:
+                if _traffic_instance is not None:
+                    _traffic_instance.close()
+                _traffic_instance = TrafficDB(target)
     return _traffic_instance
 
 

@@ -47,7 +47,21 @@ def reset_ddp_perf():
 def get_ddp_perf_seconds():
     return _DDP_PERF_SECONDS
 
-def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source_file_periods=None):
+def add_ddp_perf(seconds):
+    """Adaugă timpul măsurat într-un proces worker (însumat pe toate procesele;
+    cu paralelism, e timp CPU cumulat, nu timp de perete)."""
+    global _DDP_PERF_SECONDS
+    _DDP_PERF_SECONDS += float(seconds or 0.0)
+
+def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source_file_periods=None,
+                              mzl_manual=None, live_sources=None, localitate_site=None,
+                              db_writes=None):
+    # Parametri opționali pentru rularea în proces worker (fără acces la SQLite):
+    #   mzl_manual      dict {(an, luna): mzl} citit dinainte de procesul principal
+    #   live_sources    rezultatul get_source_files_periods(site_id), citit dinainte
+    #   localitate_site text gata calculat (" - Localitate" sau "")
+    #   db_writes       listă în care se COLECTEAZĂ scrierile în trafic_mzl/trafic_mza
+    #                   (procesul principal le aplică). None = scrie direct (vechiul mod).
     MIN_ORE_ZI    = 22
     MIN_ZILE_LUNA = 15
     MIN_ZILE_SAPT = 7
@@ -221,16 +235,13 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     last_date  = daily_classes['Zi'].max().strftime('%d.%m.%Y')
 
     # --- Extragere Localitate din Centralizator ---
-    localitate_site = ""
-    try:
-        path_centralizator = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
-        if os.path.exists(path_centralizator):
-            df_contoare = pd.read_excel(path_centralizator, sheet_name='Contoare')
-            match = df_contoare[df_contoare.iloc[:, 0].astype(str).str.contains(str(site_id))]
-            if not match.empty:
-                localitate_site = f" - {match.iloc[0, 3]}"
-    except Exception as e:
-        print(f"Atenție: Nu s-a putut citi localitatea din centralizator: {e}")
+    # NU citim centralizatorul aici: rulează într-un proces worker, iar
+    # citirea individuală, din mai multe procese simultan, a aceluiași fișier
+    # de pe rețea a cauzat blocaje pentru alți utilizatori ai serverului.
+    # Localitatea se calculează O SINGURĂ DATĂ, în procesul principal, cu
+    # precompute_localitati(), și se pasează aici gata calculată.
+    if localitate_site is None:
+        localitate_site = ""
 
     # ── Construire headers dinamici pentru Rezumat Zilnic ───────────────────
     # Structura: Data | Zi | Clase 1-8 | Clasa 15 | TOTAL | Total_B1..BN | Varf_B1..BN | B1%..BN% | Indicator | Ore
@@ -1046,44 +1057,14 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     ws_lunar = wb.create_sheet("Media Zilnica Lunara")
 
     # ── Citim suprascrierile manuale direct din SQLite (trafic.db) ────────────
-    _manual_overrides = {}   # {(an, luna): valoare_mzl_totala}
-    try:
-        from database import get_traffic_db as _get_tdb
-        _manual_overrides = _get_tdb().get_mzl_manual(str(site_id))
-    except Exception as _e:
-        # Fallback: citim din sheet-ul Excel al centralizatorului (compatibilitate)
-        try:
-            _central_file = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
-            if os.path.exists(_central_file):
-                _wb_c = openpyxl.load_workbook(_central_file, data_only=True)
-                if "Prelucrare manuala" in _wb_c.sheetnames:
-                    _ws_pm = _wb_c["Prelucrare manuala"]
-                    _pm_headers = {}
-                    for _ci in range(1, _ws_pm.max_column + 1):
-                        _v = _ws_pm.cell(2, _ci).value
-                        if _v is not None:
-                            _pm_headers[str(_v).strip()] = _ci
-                    _site_str = str(site_id)
-                    for _r in range(3, _ws_pm.max_row + 1):
-                        _ct_col  = _pm_headers.get("Contor")
-                        _an_col  = _pm_headers.get("An")
-                        _lu_col  = _pm_headers.get("Luna")
-                        _mzl_col = _pm_headers.get("MZL_Manual")
-                        if not all([_ct_col, _an_col, _lu_col, _mzl_col]):
-                            break
-                        _ct_val = _ws_pm.cell(_r, _ct_col).value
-                        if _ct_val is None or str(_ct_val).strip() != _site_str:
-                            continue
-                        try:
-                            _an_v  = int(float(str(_ws_pm.cell(_r, _an_col).value)))
-                            _lu_v  = int(float(str(_ws_pm.cell(_r, _lu_col).value)))
-                            _mzl_v = float(str(_ws_pm.cell(_r, _mzl_col).value))
-                            _manual_overrides[(_an_v, _lu_v)] = _mzl_v
-                        except Exception:
-                            continue
-                _wb_c.close()
-        except Exception as _e2:
-            print(f"[WARN] Nu s-au putut citi suprascrierile manuale: {_e2}")
+    # NU citim din SQLite aici: rulează într-un proces worker. Valoarea e
+    # citită o singură dată, în procesul principal (un singur scriitor/cititor
+    # pe baza de rețea), și pasată aici gata calculată — niciodată None
+    # din fluxul normal (build_counter_report_task pasează mereu un dict,
+    # gol dacă citirea a eșuat în procesul principal — vezi
+    # read_mzl_manual_fallback_from_centralizator(), apelată din procesul
+    # principal, niciodată de aici).
+    _manual_overrides = mzl_manual if mzl_manual is not None else {}
 
     ore_pe_zi2  = df.groupby(['An', 'Luna', 'Zi']).size().reset_index(name='Ore')
     zile_valide = ore_pe_zi2[ore_pe_zi2['Ore'] >= MIN_ORE_ZI][['An', 'Luna', 'Zi']]
@@ -1378,8 +1359,9 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     # Se recalculează și se rescrie ÎNTOTDEAUNA tot istoricul contorului, la
     # fiecare generare de raport — fără nicio verificare de cache.
     try:
-        from database import get_traffic_db as _get_tdb_save
-        _tdb_save = _get_tdb_save()
+        if db_writes is None:
+            from database import get_traffic_db as _get_tdb_save
+            _tdb_save = _get_tdb_save()
         for _entry in _mzl_snapshot:
             _an_e, _luna_e = int(_entry['An']), int(_entry['Luna'])
             _mzl_calculat  = _entry.get('MZL_Calculat', _entry.get('Total', 0)) or 0
@@ -1396,7 +1378,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 _zv, _zl = 0, 0
             _clase_snapshot = {f'Clasa_{i}': _entry.get(f'Clasa_{i}', 0) for i in range(1, 9)}
             _clase_snapshot['Clasa_15'] = _entry.get('Clasa_15', 0)
-            _tdb_save.upsert_trafic_mzl(
+            _kw_mzl = dict(
                 contor=str(site_id),
                 an=_an_e,
                 luna=_luna_e,
@@ -1412,6 +1394,10 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 mod_functionare=_entry.get('Mod_functionare', ''),
                 color=_entry.get('Color', ''),
             )
+            if db_writes is not None:
+                db_writes.append(("mzl", _kw_mzl))
+            else:
+                _tdb_save.upsert_trafic_mzl(**_kw_mzl)
     except Exception as _e_mzl_save:
         print(f"[WARN] Nu s-a putut salva trafic_mzl pentru {site_id}: {_e_mzl_save}")
 
@@ -1650,11 +1636,9 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         # centralizator, alte scripturi) să poată citi MZA direct din SQLite
         # fără să regenereze raportul Excel complet.
         try:
-            from database import get_traffic_db as _get_tdb_mza
-            _tdb_mza = _get_tdb_mza()
             _mza_clase = {f'Clasa_{i}': medii_mza.get(f'Clasa_{i}', 0) for i in range(1, 9)}
             _mza_clase['Clasa_15'] = medii_mza.get('Clasa_15', 0)
-            _tdb_mza.upsert_trafic_mza(
+            _kw_mza = dict(
                 contor=str(site_id),
                 an=int(an_mza),
                 clase=_mza_clase,
@@ -1665,6 +1649,11 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                 mod_functionare=mod_mza,
                 luni_valide=int(n_luni_val),
             )
+            if db_writes is not None:
+                db_writes.append(("mza", _kw_mza))
+            else:
+                from database import get_traffic_db as _get_tdb_mza
+                _get_tdb_mza().upsert_trafic_mza(**_kw_mza)
         except Exception as _e_mza_save:
             print(f"[WARN] Nu s-a putut salva trafic_mza pentru {site_id}/{an_mza}: {_e_mza_save}")
 
@@ -2436,11 +2425,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         # procesată, cu perioada ei — variantele vechi ale aceluiași fișier
         # sunt eliminate automat (deduplicare pe nume de fișier, în
         # get_source_files_periods()).
-        try:
-            from database import get_traffic_db as _get_tdb2
-            _live_sources = _get_tdb2().get_source_files_periods(str(site_id))
-        except Exception:
-            _live_sources = []
+        # NU citim din SQLite aici — vezi nota de la _manual_overrides mai sus.
+        _live_sources = live_sources if live_sources is not None else []
 
         if _live_sources:
             for _s in _live_sources:
@@ -2508,6 +2494,132 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
 
     wb.active = wb.sheetnames.index("Rezumat Zilnic")
     wb.save(excel_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RULARE ÎN PARALEL (un contor = un job, într-un proces worker)
+# ══════════════════════════════════════════════════════════════════════════════
+def read_mzl_manual_fallback_from_centralizator(site_id):
+    """
+    Fallback pentru MZL manual, folosit DOAR din procesul principal, când
+    citirea din SQLite (get_mzl_manual) a eșuat: citește suprascrierile din
+    foaia "Prelucrare manuala" a centralizatorului.
+    NU se apelează niciodată dintr-un proces worker — un fișier de pe rețea
+    citit simultan de mai multe procese a cauzat blocaje pentru alți
+    utilizatori ai serverului.
+    Întoarce {} la orice eroare sau dacă foaia/coloanele nu există.
+    """
+    _manual_overrides = {}
+    try:
+        _central_file = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+        if os.path.exists(_central_file):
+            _wb_c = openpyxl.load_workbook(_central_file, data_only=True)
+            if "Prelucrare manuala" in _wb_c.sheetnames:
+                _ws_pm = _wb_c["Prelucrare manuala"]
+                _pm_headers = {}
+                for _ci in range(1, _ws_pm.max_column + 1):
+                    _v = _ws_pm.cell(2, _ci).value
+                    if _v is not None:
+                        _pm_headers[str(_v).strip()] = _ci
+                _site_str = str(site_id)
+                for _r in range(3, _ws_pm.max_row + 1):
+                    _ct_col  = _pm_headers.get("Contor")
+                    _an_col  = _pm_headers.get("An")
+                    _lu_col  = _pm_headers.get("Luna")
+                    _mzl_col = _pm_headers.get("MZL_Manual")
+                    if not all([_ct_col, _an_col, _lu_col, _mzl_col]):
+                        break
+                    _ct_val = _ws_pm.cell(_r, _ct_col).value
+                    if _ct_val is None or str(_ct_val).strip() != _site_str:
+                        continue
+                    try:
+                        _an_v  = int(float(str(_ws_pm.cell(_r, _an_col).value)))
+                        _lu_v  = int(float(str(_ws_pm.cell(_r, _lu_col).value)))
+                        _mzl_v = float(str(_ws_pm.cell(_r, _mzl_col).value))
+                        _manual_overrides[(_an_v, _lu_v)] = _mzl_v
+                    except Exception:
+                        continue
+            _wb_c.close()
+    except Exception as _e2:
+        print(f"[WARN] Nu s-au putut citi suprascrierile manuale din centralizator: {_e2}")
+    return _manual_overrides
+
+
+def precompute_localitati(site_ids):
+    """Citește foaia 'Contoare' din centralizator O SINGURĂ DATĂ și întoarce
+    {site_id: " - Localitate" | ""}. Aceeași logică de potrivire ca înainte.
+    La eroare întoarce {} — workerul primește None și îl tratează ca ""
+    (NU încearcă să citească el însuși centralizatorul; vezi nota din
+    add_charts_and_formatting)."""
+    out = {}
+    try:
+        path_c = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+        if not os.path.exists(path_c):
+            return {str(s): "" for s in site_ids}
+        df_c = pd.read_excel(path_c, sheet_name='Contoare')
+        col0 = df_c.iloc[:, 0].astype(str)
+        for sid in site_ids:
+            match = df_c[col0.str.contains(str(sid))]
+            out[str(sid)] = f" - {match.iloc[0, 3]}" if not match.empty else ""
+    except Exception as e:
+        print(f"Atenție: Nu s-a putut citi localitatea din centralizator: {e}")
+        return {}
+    return out
+
+
+def apply_db_writes(writes):
+    """Aplică în procesul principal scrierile colectate de workeri."""
+    if not writes:
+        return
+    from database import get_traffic_db
+    tdb = get_traffic_db()
+    for kind, kw in writes:
+        try:
+            if kind == "mzl":
+                tdb.upsert_trafic_mzl(**kw)
+            elif kind == "mza":
+                tdb.upsert_trafic_mza(**kw)
+        except Exception as e:
+            print(f"[WARN] Nu s-a putut salva trafic_{kind} pentru {kw.get('contor')}: {e}")
+
+
+def build_counter_report_task(job):
+    """
+    Generează raportul Excel al unui contor. Rulează într-un proces worker
+    (sau inline). NU folosește SQLite.
+    Scrie întâi într-un fișier temporar și abia la final îl înlocuiește pe cel
+    real (os.replace) — o anulare/cădere nu lasă rapoarte pe jumătate scrise.
+    job: site_id, output_fn, tmp_fn, df, has_traffic, zero_msg, source_files,
+         source_file_periods, mzl_manual, live_sources, localitate_site
+    """
+    reset_ddp_perf()
+    site_id = job["site_id"]
+    tmp_fn, out_fn = job["tmp_fn"], job["output_fn"]
+
+    df_src = job["df"]
+    df_export = df_src.drop(columns=["N_Benzi", "Timestamp"], errors="ignore").reset_index(drop=True)
+    df_export.to_excel(tmp_fn, index=False, sheet_name="Date Detaliate")
+
+    if job["has_traffic"]:
+        df_charts = df_src.copy()
+        df_charts["Timestamp"] = pd.to_datetime(
+            df_charts["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce")
+        writes = []
+        add_charts_and_formatting(
+            tmp_fn, df_charts, site_id,
+            source_files=job["source_files"],
+            source_file_periods=job["source_file_periods"],
+            mzl_manual=job["mzl_manual"],
+            live_sources=job["live_sources"],
+            localitate_site=job["localitate_site"],
+            db_writes=writes,
+        )
+    else:
+        writes = []
+        print(job["zero_msg"])
+
+    os.replace(tmp_fn, out_fn)
+    return {"db_writes": writes, "ddp_seconds": get_ddp_perf_seconds()}
 
 
 

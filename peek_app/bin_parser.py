@@ -13,6 +13,7 @@ import os
 import re
 import struct
 import pandas as pd
+from concurrent.futures import wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 
 from config import (
@@ -20,8 +21,15 @@ from config import (
     RAPOARTE_PEEK_FOLDER,
     MIN_ORE_ZI, BAND_COLORS,
 )
-from excel_report import add_charts_and_formatting
+from excel_report import (
+    add_charts_and_formatting, precompute_localitati,
+    read_mzl_manual_fallback_from_centralizator,
+)
 from database import get_traffic_db
+from parallel_utils import (
+    PoolHandle, ReportRunner, StopRequested, get_worker_count,
+    submit_safe, get_safe, wait_one, timed_db, get_db_perf_breakdown,
+)
 
 
 def _remap_clase_ro08_la_ro23(clase_ro08):
@@ -320,7 +328,59 @@ def process_peek_bin(filepath, warning_callback=None):
                 best_run, best_start = run, cand
         return best_start if best_run >= min_run else None
 
-    pos_ro08 = raw.rfind(b'RO08') if (pos_ro23 == -1 and not is_ro04r) else -1
+    def _scan_ro08_totalizator_nb(raw, search_from, n_lanes_cand,
+                                   search_range=200, min_run=8):
+        # Totalizator pe N benzi — fără nicio repartiție pe clase: doar
+        # totalul pe bandă, stocat DE DOUĂ ORI la rând (validare redundantă,
+        # ca la clasificator), apoi terminator 0x00. Verificat pe fișier
+        # real (contoare 5487 și 7022): valorile decodate coincid exact cu
+        # TOPS, oră cu oră.
+        #   [oră_sfârșit(1B)] [V1..VN varint ×N] [V1..VN varint ×N, identic] [0x00]
+        best_start, best_run = None, 0
+        limit = min(search_from + search_range, len(raw))
+        for cand in range(search_from, limit):
+            pos, run, prev_h = cand, 0, None
+            while pos < len(raw) - 2 and run < 5000:
+                h = raw[pos]
+                if h > 23:
+                    break
+                p = pos + 1
+                vals, ok = [], True
+                for _ in range(n_lanes_cand):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    vals.append(v)
+                if not ok: break
+                vals2, ok = [], True
+                for _ in range(n_lanes_cand):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    vals2.append(v)
+                if not ok: break
+                if vals != vals2:
+                    break
+                if p >= len(raw) or raw[p] != 0x00:
+                    break
+                if prev_h is not None and h != (prev_h + 1) % 24:
+                    break
+                prev_h = h
+                run += 1
+                pos = p + 1
+            if run > best_run:
+                best_run, best_start = run, cand
+        return best_start if best_run >= min_run else None
+
+    # Marcajul de clasificare nu e mereu "RO08" — verificat pe fișiere reale,
+    # unele contoare (mai ales configurate totalizator) au "FHWA-USA" în
+    # același câmp de 8 caractere + NUL. Tratăm orice astfel de marcaj
+    # necunoscut ca RO08 (clasificare veche), aceeași structură pe disc.
+    _RO08_ALT_MARKERS = (b'RO08', b'FHWA-USA')
+    pos_ro08 = -1
+    if pos_ro23 == -1 and not is_ro04r:
+        for _marker in _RO08_ALT_MARKERS:
+            _p = raw.rfind(_marker)
+            if _p > pos_ro08:
+                pos_ro08 = _p
     ro08_scan_start      = None
     ro08_n_lanes         = None
     ro08_is_totalizator  = False
@@ -332,7 +392,16 @@ def process_peek_bin(filepath, warning_callback=None):
             if _start is not None:
                 ro08_scan_start, ro08_n_lanes, ro08_is_totalizator = _start, _n_cand, False
                 break
-        # Totalizator (doar dacă niciun clasificator nu a validat)
+        # Totalizator pe N benzi (valori duplicate) — doar dacă niciun
+        # clasificator nu a validat.
+        if ro08_scan_start is None:
+            for _n_cand in (2, 4, 6):
+                _start = _scan_ro08_totalizator_nb(raw, pos_ro08 + 9, _n_cand)
+                if _start is not None:
+                    ro08_scan_start, ro08_n_lanes, ro08_is_totalizator = _start, _n_cand, True
+                    break
+        # Totalizator 2 benzi (variantă mai veche, fără duplicare) — ultimă
+        # variantă încercată.
         if ro08_scan_start is None:
             _tot_start = _scan_totalizator_2b(raw, pos_ro08 + 8)
             if _tot_start is not None:
@@ -405,19 +474,25 @@ def process_peek_bin(filepath, warning_callback=None):
             p = pos + 1
 
             if ro08_is_totalizator:
-                b1, p = _decode_val_tot(raw, p)
-                b2, p = _decode_val_tot(raw, p)
-                _b1d, p = _decode_val_tot(raw, p)
-                _b2d, p = _decode_val_tot(raw, p)
-                if b1 is None or b2 is None:
-                    break
+                vals, ok = [], True
+                for _ in range(ro08_n_lanes):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    vals.append(v)
+                if not ok: break
+                vals2, ok = [], True
+                for _ in range(ro08_n_lanes):
+                    v, p = _decode_val_ro08(raw, p)
+                    if v is None: ok = False; break
+                    vals2.append(v)
+                if not ok: break
                 if p >= len(raw) or raw[p] != 0x00:
                     break
                 pos = p + 1
-                totals = [b1, b2]
-                bands_final = [[0] * 15, [0] * 15]
-                bands_final[0][14] = b1
-                bands_final[1][14] = b2
+                totals = vals
+                bands_final = [[0] * 15 for _ in range(ro08_n_lanes)]
+                for _i, _v in enumerate(vals):
+                    bands_final[_i][14] = _v
             else:
                 totals, ok = [], True
                 for _ in range(ro08_n_lanes):
@@ -1144,7 +1219,7 @@ def process_peek_bin(filepath, warning_callback=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def quick_scan_bin(filepath):
+def quick_scan_bin(filepath, rescue_unknown=True):
     """
     Citește rapid un fișier .bin și returnează (site_id, n_records, n_lanes).
     Detectează automat RO23 (PEEK/Sabre), Ro04R și numărul de benzi.
@@ -1199,6 +1274,29 @@ def quick_scan_bin(filepath):
                     break
         else:
             if pos_ro23 == -1:
+                # Fără marcaj RO23 și fără Ro04R: poate fi format RO08 /
+                # FHWA-USA (clasificare veche) — nu are offset fix, așa că
+                # numărăm înregistrările cu parserul real, care îl detectează.
+                # print()-urile parserului sunt înghițite aici — apar o
+                # singură dată, la procesarea propriu-zisă. Returnează:
+                #   n > 0  → recorduri găsite;  0 → gol;
+                #   -1     → marcaj RO08 găsit dar recordurile NU au putut fi
+                #            localizate (parserul ar cădea pe decodarea implicită).
+                if rescue_unknown:
+                    import io, contextlib
+                    _buf = io.StringIO()
+                    _df = None
+                    try:
+                        with contextlib.redirect_stdout(_buf):
+                            _df, _sid, _dt, _nl = process_peek_bin(
+                                filepath,
+                                warning_callback=lambda *_a, **_k: None)
+                    except Exception:
+                        _df = None
+                    if "nu am putut localiza" in _buf.getvalue():
+                        return site_id, -1, n_lanes
+                    if _df is not None and len(_df) > 0:
+                        return site_id, len(_df), (_nl or n_lanes)
                 return site_id, 0, n_lanes
             # Decodăm în all_vals și numărăm recorduri
             start = pos_ro23 + 68
@@ -1223,24 +1321,158 @@ def quick_scan_bin(filepath):
 
 
 
+class _Heartbeat:
+    """
+    „Semn de viață” pentru procesări lungi: dacă pasul curent durează mai mult
+    de `every` secunde fără să se schimbe, scrie în jurnal ce se întâmplă.
+    Un blocaj devine astfel vizibil (la ce pas, de cât timp, ce fișiere).
+    """
+    def __init__(self, emit, every=120):
+        import threading, time
+        self._emit, self._every = emit, every
+        self._detail, self._since = "pornire", time.time()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def set(self, detail):
+        import time
+        self._detail, self._since = detail, time.time()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        import time
+        while not self._stop.wait(self._every):
+            stat = time.time() - self._since
+            if stat >= self._every:
+                try:
+                    self._emit(f"  ⏳ Același pas de {stat/60:.0f} min: {self._detail}")
+                except Exception:
+                    pass
+
+
+def _parse_bin_task(filepath):
+    """
+    Parsează UN fișier .bin. Rulează într-un proces worker (sau inline).
+    Avertismentele de date implauzibile sunt colectate și trimise la GUI de
+    procesul principal (un callback de interfață nu poate trece între procese).
+    """
+    warns = []
+    try:
+        df, site_id, start_date, n_lanes = process_peek_bin(
+            filepath, warning_callback=warns.append)
+    except Exception as e:
+        return {"error": str(e), "warnings": warns}
+    return {"df": df, "site_id": site_id, "start_date": start_date,
+            "n_lanes": n_lanes, "warnings": warns}
+
+
+def _parse_all_bin(pool, filepaths, stop_event, warning_callback, hb=None):
+    """
+    Faza 1: parsare în paralel. Întoarce lista rezultatelor ALINIATĂ cu
+    filepaths (ordinea contează la deduplicare: keep="last"), sau None dacă
+    s-a anulat.
+    """
+    outs = [None] * len(filepaths)
+    pending = {}
+    done_n = [0]
+
+    def _hb_update():
+        if hb is None:
+            return
+        _run = [os.path.basename(filepaths[i]) for f, i in pending.items()
+                if not f.done()][:4]
+        hb.set(f"Faza 1 (parsare): {done_n[0]}/{len(filepaths)} fișiere gata; "
+               f"în lucru: {', '.join(_run) or '—'}")
+
+    def _take(fut):
+        i = pending.pop(fut)
+        done_n[0] += 1
+        if warning_callback and done_n[0] % 250 == 0:
+            try:
+                warning_callback(f"  … parsate {done_n[0]}/{len(filepaths)} fișiere")
+            except Exception:
+                pass
+        _hb_update()
+        fp = filepaths[i]
+        res = get_safe(fut, _parse_bin_task, fp)
+        if res.get("log"):
+            print(res["log"], end="" if res["log"].endswith("\n") else "\n")
+        if not res["ok"]:
+            print(f"Sărit fișier corupt {fp}: {res['error'].strip().splitlines()[-1]}")
+            return
+        out = res["result"]
+        for w in out.get("warnings", []):
+            if warning_callback:
+                try:
+                    warning_callback(w)
+                except Exception:
+                    pass
+        if out.get("error"):
+            print(f"Sărit fișier corupt {fp}: {out['error']}")
+            return
+        outs[i] = out
+
+    for i, fp in enumerate(filepaths):
+        if stop_event and stop_event.is_set():
+            return None
+        fut = submit_safe(pool, _parse_bin_task, fp)
+        pending[fut] = i
+        for f in [f for f in pending if f.done()]:      # colectăm ce e gata
+            _take(f)
+
+    while pending:
+        if stop_event and stop_event.is_set():
+            return None
+        wait(list(pending), timeout=0.25, return_when=FIRST_COMPLETED)
+        for f in [f for f in pending if f.done()]:
+            _take(f)
+    return outs
+
+
 def process_multiple_files(filepaths, output_dir=None, stop_event=None,
                            progress_callback=None, warning_callback=None):
     """
     progress_callback(site_id, n_ore, idx, total_contoare) — apelat după
-    fiecare contor procesat și scris în SQLite + Excel.
+    fiecare contor terminat (SQLite + Excel). Se apelează din firul care a
+    chemat funcția, pe măsură ce procesele worker termină contoarele
+    (ordinea de terminare poate diferi de ordinea inițială).
     warning_callback(msg) — apelat pentru fiecare avertisment de date
-    implauzibile (oră neutralizată), pentru afișare live în GUI.
+    implauzibile (oră neutralizată) și pentru erori la un contor, pentru
+    afișare live în GUI.
+
+    Paralelism (mai multe nuclee):
+      Faza 1 — parsarea fișierelor .bin, în procese separate.
+      Faza 2 — per contor: scrierea în SQLite și citirea istoricului se fac
+               în procesul principal (un singur scriitor în DB); generarea
+               Excel + grafice se trimite către procese worker.
+    Numărul de procese: vezi parallel_utils.get_worker_count().
     """
     contoare_data  = {}
     contoare_lanes = {}
     contoare_files = {}
 
-    for filepath in filepaths:
-        if stop_event and stop_event.is_set():
-            return None   # anulat de utilizator
-        try:
-            df, site_id, start_date, n_lanes = process_peek_bin(
-                filepath, warning_callback=warning_callback)
+    if not filepaths:
+        print("Nu s-au găsit date valide în niciun fișier.")
+        return None
+
+    pool = PoolHandle(get_worker_count(len(filepaths)) if len(filepaths) >= 2 else 1)
+    runner = None
+    hb = _Heartbeat(warning_callback or print)
+    try:
+        # ── FAZA 1: parsare fișiere (paralel) ────────────────────────────────
+        hb.set(f"Faza 1 (parsare): 0/{len(filepaths)} fișiere")
+        parsed = _parse_all_bin(pool, filepaths, stop_event, warning_callback, hb)
+        if parsed is None:
+            pool.abort()
+            return None
+
+        for filepath, out in zip(filepaths, parsed):     # ordinea inițială
+            if out is None:
+                continue
+            df, site_id, n_lanes = out["df"], out["site_id"], out["n_lanes"]
             if df is None or df.empty:
                 continue
             if site_id not in contoare_data:
@@ -1252,185 +1484,267 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
             # Păstrăm numărul maxim de benzi găsite pentru acest contor
             if n_lanes > contoare_lanes[site_id]:
                 contoare_lanes[site_id] = n_lanes
-        except Exception as e:
-            print(f"Sărit fișier corupt {filepath}: {e}")
-            continue
 
-    if not contoare_data:
-        print("Nu s-au găsit date valide în niciun fișier.")
-        return None
+        if not contoare_data:
+            print("Nu s-au găsit date valide în niciun fișier.")
+            pool.close()
+            return None
 
-    rezultate_finale = []
-    # Rapoartele se salvează întotdeauna în subfolderul central, indiferent
-    # de unde au fost selectate fișierele .bin (folder local, recursiv, etc.)
-    out_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
-    os.makedirs(out_dir, exist_ok=True)
-    _total_ct = len(contoare_data)
+        # Rapoartele se salvează în output_dir dacă e specificat (sesiune
+        # sincronizată local), altfel în subfolderul central de pe rețea —
+        # indiferent de unde au fost selectate fișierele .bin.
+        out_dir = output_dir or os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+        os.makedirs(out_dir, exist_ok=True)
+        _total_ct = len(contoare_data)
 
-    for _idx_ct, (site_id, lista_dfs) in enumerate(contoare_data.items(), 1):
-        n_lanes = contoare_lanes[site_id]
-
-        df_total = pd.concat(lista_dfs, ignore_index=True)
-
-        # ── Calculăm perioada per fișier sursă (înainte de deduplicare) ──────
-        source_fps = contoare_files.get(site_id, [])
-        file_periods = {}
-        for fp, df_f in zip(source_fps, lista_dfs):
-            if not df_f.empty:
-                dt_series = pd.to_datetime(
-                    df_f["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce"
-                ).dropna()
-                if not dt_series.empty:
-                    file_periods[os.path.basename(fp)] = (
-                        dt_series.min().strftime("%d.%m.%Y"),
-                        dt_series.max().strftime("%d.%m.%Y"),
-                    )
-
-        # Convertim Data_Ora în datetime real
-        df_total["Data_Ora_dt"] = pd.to_datetime(
-            df_total["Data_Ora"],
-            format="%d.%m.%Y %H:%M",
-            errors="coerce"
-        )
-
-        # Sortare cronologică
-        df_total = df_total.sort_values(["Contor", "Data_Ora_dt"])
-
-        # Eliminare duplicate pentru același contor + aceeași oră
-        df_total = df_total.drop_duplicates(
-            subset=["Contor", "Data_Ora_dt"],
-            keep="last"
-        )
-
-        # Ștergem coloanele auxiliare
-        df_total = df_total.drop(columns=["Data_Ora_dt"], errors="ignore")
-
-        # Eliminăm benzile cu total zero dacă sunt mai puține benzi reale
-        # (benzile 0 au fost adăugate pentru compatibilitate, nu le exportăm)
-        # Păstrăm doar benzile până la n_lanes
-        cols_to_drop = []
-        for b in range(n_lanes + 1, 7):
-            for c in range(1, 16):
-                col = f"B{b}_Clasa_{c}"
-                if col in df_total.columns:
-                    cols_to_drop.append(col)
-            if f"Total_B{b}" in df_total.columns:
-                cols_to_drop.append(f"Total_B{b}")
-        if cols_to_drop:
-            df_total = df_total.drop(columns=cols_to_drop)
-
-        # Recalculăm Total_General după tăierea benzilor
-        band_tot_cols = [f"Total_B{b}" for b in range(1, n_lanes + 1)
-                         if f"Total_B{b}" in df_total.columns]
-        df_total["Total_General"] = df_total[band_tot_cols].sum(axis=1)
-
-        # Eliminăm coloana N_Benzi din export (internă)
-        df_export = df_total.drop(columns=["N_Benzi"], errors="ignore")
-        df_export = df_export.reset_index(drop=True)
-
-        output_fn = os.path.join(out_dir, f"Raport_Clase_Peek_{site_id}.xlsx")
-
-        # ── 1. Scriere în SQLite (date orare agregate) ─────────────────────
         try:
             tdb = get_traffic_db()
-            n_scrise = tdb.upsert_hourly_df(
-                df_total,          # df_total păstrează N_Benzi
-                site_id,
-                tip_sursa="PEEK",
-                source_files=contoare_files.get(site_id, []),
-                source_file_periods=file_periods
-            )
-            print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare")
-        except Exception as _e_db:
-            print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
+        except Exception as _e_tdb:
+            tdb = None
+            print(f"  [WARN] SQLite indisponibil: {_e_tdb}")
 
-        # ── 2. Citire din SQLite — toată perioada acumulată pentru site_id ───
-        # Excel-ul reflectă ÎNTREAGA perioadă din DB, nu doar fișierele selectate acum.
-        df_din_db = None
-        all_source_files_db = contoare_files.get(site_id, [])  # fallback
-        try:
-            df_din_db = tdb.get_hourly_df(site_id)
-        except Exception as _e_read:
-            print(f"  [WARN] Citire DB eroare [{site_id}]: {_e_read}")
-
-        if df_din_db is not None and not df_din_db.empty:
-            df_for_excel = df_din_db.copy()
-
-            # Detectăm numărul real de benzi din N_Benzi din DB
-            n_lanes_db = n_lanes  # fallback: valoarea din parsarea curentă
-            if "N_Benzi" in df_for_excel.columns:
-                n_benzi_vals = df_for_excel["N_Benzi"].dropna()
-                if not n_benzi_vals.empty:
-                    n_lanes_db = int(n_benzi_vals.max())
-
-            # Eliminăm coloanele benzilor dincolo de n_lanes_db (artefacte schemă)
-            cols_schema_drop = []
-            for b in range(n_lanes_db + 1, 7):
-                tcol = f"Total_B{b}"
-                if tcol in df_for_excel.columns:
-                    cols_schema_drop.append(tcol)
-                for cls in list(range(1, 9)) + [15]:
-                    ccol = f"B{b}_Clasa_{cls}"
-                    if ccol in df_for_excel.columns:
-                        cols_schema_drop.append(ccol)
-            if cols_schema_drop:
-                df_for_excel = df_for_excel.drop(columns=cols_schema_drop, errors="ignore")
-
-            n_lanes = n_lanes_db
-            band_tot_cols = sorted(
-                [c for c in df_for_excel.columns
-                 if c.startswith("Total_B") and c != "Total_General"],
-                key=lambda x: int(x.replace("Total_B", ""))
-            )
-            if band_tot_cols:
-                df_for_excel["Total_General"] = df_for_excel[band_tot_cols].sum(axis=1)
-
-            # Lista completă a fișierelor sursă înregistrate în DB
+        if warning_callback:
             try:
-                all_source_files_db = tdb.get_source_files(site_id) or all_source_files_db
+                warning_callback(f"  ✔ Faza 1 încheiată: {len(contoare_data)} contoare "
+                                 f"cu date. Încep scrierea în SQLite și rapoartele Excel...")
             except Exception:
                 pass
-        else:
-            # Fallback: folosim datele tocmai parsate (prima rulare sau DB indisponibil)
-            df_for_excel = df_export.copy()
-
-        # ── 3. Generare Excel ──────────────────────────────────────────────
-        df_export_final = df_for_excel.drop(
-            columns=["N_Benzi", "Timestamp"], errors="ignore"
-        ).reset_index(drop=True)
-
-        all_band_totals = sum(df_export_final[c].sum() for c in band_tot_cols
-                              if c in df_export_final.columns)
-
-        df_export_final.to_excel(output_fn, index=False, sheet_name="Date Detaliate")
-
-        df_for_charts = df_for_excel.copy()
-        df_for_charts["Timestamp"] = pd.to_datetime(
-            df_for_charts["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce"
-        )
-
-        if all_band_totals > 0:
-            add_charts_and_formatting(output_fn, df_for_charts, site_id,
-                                      source_files=all_source_files_db,
-                                      source_file_periods=file_periods)
-        else:
-            print(f"Atenție: Contorul {site_id} are trafic zero. Excel generat fără grafice.")
-
-        suma_b1 = df_export_final['Total_B1'].sum() if 'Total_B1' in df_export_final.columns else 0
-        suma_b2 = df_export_final['Total_B2'].sum() if 'Total_B2' in df_export_final.columns else 0
-
-        rezultate_finale.append({
-            'path': output_fn, 'id': site_id, 'randuri': len(df_export_final),
-            'b1': suma_b1, 'b2': suma_b2, 'n_lanes': n_lanes,
-            'source_files': all_source_files_db,
-        })
-
-        # Notifică GUI progresul după fiecare contor complet (SQLite + Excel)
-        if progress_callback:
+        hb.set("Faza 2: calculez localitățile contoarelor")
+        localitati = precompute_localitati(list(contoare_data.keys()))
+        # Orele scrise ACUM în SQLite per contor (din fișierele procesate la
+        # această rulare). Se transmit callback-ului de progres ca al 5-lea
+        # argument, DOAR dacă acesta îl acceptă (apelanții vechi, cu 4
+        # argumente, rămân neschimbați).
+        _scrise_now = {}
+        _cb = progress_callback
+        if _cb is not None:
+            import inspect
             try:
-                progress_callback(site_id, len(df_export_final), _idx_ct, _total_ct)
-            except Exception:
-                pass
+                _params = inspect.signature(_cb).parameters.values()
+                _accepts5 = (len(_params) >= 5 or
+                             any(p.kind == p.VAR_POSITIONAL for p in _params))
+            except (TypeError, ValueError):
+                _accepts5 = False
+
+            def _progress_wrap(sid, n_ore, idx, total):
+                if _accepts5:
+                    return _cb(sid, n_ore, idx, total, _scrise_now.get(sid))
+                return _cb(sid, n_ore, idx, total)
+            progress_callback = _progress_wrap
+        runner = ReportRunner(pool, stop_event, progress_callback, _total_ct,
+                              warn=warning_callback)
+
+        # ── FAZA 2: per contor — DB în procesul principal, Excel în workeri ──
+        for _idx_ct, (site_id, lista_dfs) in enumerate(contoare_data.items(), 1):
+            if stop_event and stop_event.is_set():
+                runner.abort()
+                return None
+
+            n_lanes = contoare_lanes[site_id]
+            hb.set(f"Faza 2: contor {site_id} ({_idx_ct}/{_total_ct}) — pregătire date")
+
+            df_total = pd.concat(lista_dfs, ignore_index=True)
+
+            # ── Calculăm perioada per fișier sursă (înainte de deduplicare) ──
+            source_fps = contoare_files.get(site_id, [])
+            file_periods = {}
+            for fp, df_f in zip(source_fps, lista_dfs):
+                if not df_f.empty:
+                    dt_series = pd.to_datetime(
+                        df_f["Data_Ora"], format="%d.%m.%Y %H:%M", errors="coerce"
+                    ).dropna()
+                    if not dt_series.empty:
+                        file_periods[os.path.basename(fp)] = (
+                            dt_series.min().strftime("%d.%m.%Y"),
+                            dt_series.max().strftime("%d.%m.%Y"),
+                        )
+
+            # Convertim Data_Ora în datetime real
+            df_total["Data_Ora_dt"] = pd.to_datetime(
+                df_total["Data_Ora"],
+                format="%d.%m.%Y %H:%M",
+                errors="coerce"
+            )
+
+            # Sortare cronologică
+            df_total = df_total.sort_values(["Contor", "Data_Ora_dt"])
+
+            # Eliminare duplicate pentru același contor + aceeași oră
+            df_total = df_total.drop_duplicates(
+                subset=["Contor", "Data_Ora_dt"],
+                keep="last"
+            )
+
+            # Ștergem coloanele auxiliare
+            df_total = df_total.drop(columns=["Data_Ora_dt"], errors="ignore")
+
+            # Eliminăm benzile cu total zero dacă sunt mai puține benzi reale
+            # (benzile 0 au fost adăugate pentru compatibilitate, nu le exportăm)
+            # Păstrăm doar benzile până la n_lanes
+            cols_to_drop = []
+            for b in range(n_lanes + 1, 7):
+                for c in range(1, 16):
+                    col = f"B{b}_Clasa_{c}"
+                    if col in df_total.columns:
+                        cols_to_drop.append(col)
+                if f"Total_B{b}" in df_total.columns:
+                    cols_to_drop.append(f"Total_B{b}")
+            if cols_to_drop:
+                df_total = df_total.drop(columns=cols_to_drop)
+
+            # Recalculăm Total_General după tăierea benzilor
+            band_tot_cols = [f"Total_B{b}" for b in range(1, n_lanes + 1)
+                             if f"Total_B{b}" in df_total.columns]
+            df_total["Total_General"] = df_total[band_tot_cols].sum(axis=1)
+
+            # Eliminăm coloana N_Benzi din export (internă)
+            df_export = df_total.drop(columns=["N_Benzi"], errors="ignore")
+            df_export = df_export.reset_index(drop=True)
+
+            output_fn = os.path.join(out_dir, f"Raport_Clase_Peek_{site_id}.xlsx")
+
+            # ── 1. Scriere în SQLite (date orare agregate) ─────────────────
+            hb.set(f"Faza 2: contor {site_id} ({_idx_ct}/{_total_ct}) — SCRIERE în SQLite")
+            try:
+                with timed_db("scriere"):
+                    n_scrise = tdb.upsert_hourly_df(
+                        df_total,          # df_total păstrează N_Benzi
+                        site_id,
+                        tip_sursa="PEEK",
+                        source_files=contoare_files.get(site_id, []),
+                        source_file_periods=file_periods
+                    )
+                _scrise_now[site_id] = n_scrise
+                print(f"  💾 SQLite ← [{site_id}]  {n_scrise} rânduri orare")
+            except Exception as _e_db:
+                print(f"  [WARN] SQLite write eroare [{site_id}]: {_e_db}")
+
+            # ── 2. Citire din SQLite — toată perioada acumulată pentru site_id ─
+            # Excel-ul reflectă ÎNTREAGA perioadă din DB, nu doar fișierele selectate acum.
+            df_din_db = None
+            all_source_files_db = contoare_files.get(site_id, [])  # fallback
+            hb.set(f"Faza 2: contor {site_id} ({_idx_ct}/{_total_ct}) — CITIRE istoric din SQLite")
+            try:
+                with timed_db("citire"):
+                    df_din_db = tdb.get_hourly_df(site_id)
+            except Exception as _e_read:
+                print(f"  [WARN] Citire DB eroare [{site_id}]: {_e_read}")
+
+            if df_din_db is not None and not df_din_db.empty:
+                df_for_excel = df_din_db.copy()
+
+                # Detectăm numărul real de benzi din N_Benzi din DB
+                n_lanes_db = n_lanes  # fallback: valoarea din parsarea curentă
+                if "N_Benzi" in df_for_excel.columns:
+                    n_benzi_vals = df_for_excel["N_Benzi"].dropna()
+                    if not n_benzi_vals.empty:
+                        n_lanes_db = int(n_benzi_vals.max())
+
+                # Eliminăm coloanele benzilor dincolo de n_lanes_db (artefacte schemă)
+                cols_schema_drop = []
+                for b in range(n_lanes_db + 1, 7):
+                    tcol = f"Total_B{b}"
+                    if tcol in df_for_excel.columns:
+                        cols_schema_drop.append(tcol)
+                    for cls in list(range(1, 9)) + [15]:
+                        ccol = f"B{b}_Clasa_{cls}"
+                        if ccol in df_for_excel.columns:
+                            cols_schema_drop.append(ccol)
+                if cols_schema_drop:
+                    df_for_excel = df_for_excel.drop(columns=cols_schema_drop, errors="ignore")
+
+                n_lanes = n_lanes_db
+                band_tot_cols = sorted(
+                    [c for c in df_for_excel.columns
+                     if c.startswith("Total_B") and c != "Total_General"],
+                    key=lambda x: int(x.replace("Total_B", ""))
+                )
+                if band_tot_cols:
+                    df_for_excel["Total_General"] = df_for_excel[band_tot_cols].sum(axis=1)
+
+                # Lista completă a fișierelor sursă înregistrate în DB
+                try:
+                    with timed_db("surse"):
+                        all_source_files_db = tdb.get_source_files(site_id) or all_source_files_db
+                except Exception:
+                    pass
+            else:
+                # Fallback: folosim datele tocmai parsate (prima rulare sau DB indisponibil)
+                df_for_excel = df_export.copy()
+
+            # ── 3. Excel: trimis către un proces worker ────────────────────
+            all_band_totals = sum(df_for_excel[c].sum() for c in band_tot_cols
+                                  if c in df_for_excel.columns)
+
+            # Citiri din DB făcute AICI (procesele worker nu ating SQLite).
+            # None => workerul reia citirea/fallback-ul original.
+            # Implicit: goale, nu None — un worker primind None ar încerca să
+            # citească el însuși din rețea (vezi read_mzl_manual_fallback_...).
+            # Aici, în procesul principal, un eșec are un fallback sigur:
+            # foaia "Prelucrare manuala" a centralizatorului, citită O SINGURĂ
+            # DATĂ per contor, niciodată din interiorul unui worker.
+            _mzl_manual = {}
+            _live_src   = []
+            hb.set(f"Faza 2: contor {site_id} ({_idx_ct}/{_total_ct}) — citire MZL manual / surse")
+            if tdb is not None:
+                try:
+                    with timed_db("mzl_manual"):
+                        _mzl_manual = tdb.get_mzl_manual(str(site_id)) or {}
+                except Exception as _e_mzl:
+                    print(f"  [WARN] Citire MZL manual eroare [{site_id}]: {_e_mzl}")
+                    _mzl_manual = read_mzl_manual_fallback_from_centralizator(site_id)
+                try:
+                    with timed_db("surse"):
+                        _live_src = tdb.get_source_files_periods(str(site_id)) or []
+                except Exception as _e_live:
+                    print(f"  [WARN] Citire surse fisier eroare [{site_id}]: {_e_live}")
+                    _live_src = []
+            else:
+                _mzl_manual = read_mzl_manual_fallback_from_centralizator(site_id)
+
+            suma_b1 = df_for_excel['Total_B1'].sum() if 'Total_B1' in df_for_excel.columns else 0
+            suma_b2 = df_for_excel['Total_B2'].sum() if 'Total_B2' in df_for_excel.columns else 0
+            n_randuri = len(df_for_excel)
+
+            job = {
+                "site_id": site_id,
+                "output_fn": output_fn,
+                "tmp_fn": os.path.join(out_dir, f".tmp_{os.path.basename(output_fn)}"),
+                "df": df_for_excel,
+                "has_traffic": all_band_totals > 0,
+                "zero_msg": (f"Atenție: Contorul {site_id} are trafic zero. "
+                             f"Excel generat fără grafice."),
+                "source_files": all_source_files_db,
+                "source_file_periods": file_periods,
+                "mzl_manual": _mzl_manual,
+                "live_sources": _live_src,
+                "localitate_site": localitati.get(str(site_id)),
+            }
+            rezultat = {
+                'path': output_fn, 'id': site_id, 'randuri': n_randuri,
+                'b1': suma_b1, 'b2': suma_b2, 'n_lanes': n_lanes,
+                'source_files': all_source_files_db,
+            }
+            hb.set(f"Faza 2: contor {site_id} ({_idx_ct}/{_total_ct}) — trimit Excel către worker "
+                   f"(poate aștepta un worker liber)")
+            runner.submit(job, order=_idx_ct, rezultat=rezultat,
+                          site_id=site_id, randuri=n_randuri)
+
+        # ── Așteptăm ce a mai rămas în procesele worker ─────────────────────
+        hb.set(f"Faza 2: aștept încheierea Excel-urilor din procesele worker "
+               f"({_total_ct} contoare)")
+        rezultate_finale = runner.finish()
+        if rezultate_finale is None:      # anulat de utilizator
+            return None
+
+    except StopRequested:
+        (runner or pool).abort()
+        return None
+    except BaseException:
+        (runner or pool).abort()
+        raise
+    finally:
+        hb.stop()
 
     if not rezultate_finale:
         return None

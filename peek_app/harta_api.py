@@ -183,13 +183,14 @@ def _build_response() -> list:
     cdb = get_contoare_db()
     tdb = get_traffic_db()
 
-    contoare_dict    = cdb.get_all()
+    contoare_dict    = cdb.get_all()          # doar contoarele ACTIVE
     contoare_cu_date = set(tdb.get_contoare_disponibile())
     coduri_vechi     = _get_coduri_vechi()  # exclude codurile redenumite
+    inactivi         = cdb.get_inactive()   # debifate în Gestionare Contoare
 
-    # Excludem codurile vechi din ambele surse
+    # Excludem codurile vechi și contoarele inactive din ambele surse
     toti = sorted(
-        (set(contoare_dict.keys()) | contoare_cu_date) - coduri_vechi
+        (set(contoare_dict.keys()) | contoare_cu_date) - coduri_vechi - inactivi
     )
 
     result = []

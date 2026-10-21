@@ -35,6 +35,8 @@ from bin_parser import quick_scan_bin, process_multiple_files
 from log_parser import process_log_files
 from centralizator import update_centralizator, update_centralizator_batch
 from excel_report import reset_ddp_perf, get_ddp_perf_seconds
+from parallel_utils import reset_db_perf, get_db_perf_seconds, get_db_perf_breakdown
+import db_sync
 from contoare_db import _load_contoare_db, _save_contoare_db, _delete_contor_from_centralizator
 from gui_widgets import (
     _rr, _ctk_btn, _make_button, _ctk_frame, _ctk_label,
@@ -166,7 +168,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             cdb = get_contoare_db()
             # Verificăm dacă DB-ul e gol
-            toate = cdb.get_all()
+            toate = cdb.get_all(include_inactive=True)
             if toate:
                 return   # DB deja populat, nimic de făcut
 
@@ -945,7 +947,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 scan_results.append((p, sid, n_brut, n_lanes))
                 fname = os.path.basename(p)
                 pct   = int(2 + (idx / total) * 8)
-                if n_brut == 0:
+                if n_brut < 0:
+                    self._log(f"  ⚠  [{sid}]  {fname}  →  RO08: recordurile nu au putut fi localizate — rezultate nesigure")
+                    fisiere_goale += 1
+                elif n_brut == 0:
                     self._log(f"  ⚠  [{sid}]  {fname}  →  fișier gol")
                     fisiere_goale += 1
                 else:
@@ -1057,7 +1062,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     scan_results.append((p, sid, n_brut, n_lanes))
                     fname = os.path.basename(p)
                     pct = int(2 + (idx / total) * 8)
-                    if n_brut == 0:
+                    if n_brut < 0:
+                        self._log(f"  ⚠  [{sid}]  {fname}  →  RO08: recordurile nu au putut fi localizate — rezultate nesigure")
+                        fisiere_goale += 1
+                    elif n_brut == 0:
                         self._log(f"  ⚠  [{sid}]  {fname}  →  fisier gol")
                         fisiere_goale += 1
                     else:
@@ -1124,7 +1132,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 rezultate_log = process_log_files(
                     self.selected_log_files,
                     output_dir=out_dir,
-                    stop_event=self.stop_event) or []
+                    stop_event=self.stop_event,
+                    warning_callback=self._log) or []
 
                 if self.stop_event.is_set(): abort(); return
 
@@ -1193,9 +1202,45 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         Thread background unificat: proceseaza .bin si/sau .log in ordine.
         """
         sep = "─" * 52
+        _sync_active = False
+        _sync_done   = False
+        local_reports_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
 
         def cancelled():
             return self.stop_event.is_set()
+
+        def sync_and_release():
+            """Trimite pe server rapoartele + baza locală (dacă am lucrat
+            sincronizat local) și eliberează lacătul. Idempotent — sigur de
+            apelat de mai multe ori (ex. și explicit, și din finally)."""
+            nonlocal _sync_done
+            if _sync_done:
+                return
+            _sync_done = True
+            if _sync_active:
+                try:
+                    self._log("\n📤 Sincronizare cu serverul...")
+                    server_reports_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+                    failed = db_sync.sync_reports_to_server(
+                        local_reports_dir, server_reports_dir, log=self._log)
+                    if failed:
+                        nume = ", ".join(f for f, _ in failed)
+                        self._log(f"  ⚠ {len(failed)} raport(oare) NU s-au copiat pe "
+                                  f"server: {nume}")
+                    db_sync.commit_database(log=self._log)
+                    self._log("  ✓ Sincronizare completă — datele sunt pe server.")
+                except Exception as _e_sync:
+                    self._log(f"  ✗ EROARE la sincronizarea cu serverul: {_e_sync}")
+                    self._log(f"     Datele acestei rulări rămân salvate local în:\n"
+                              f"     {db_sync.get_local_cache_dir()}\n"
+                              f"     NU le șterge manual — spune-mi și le recuperăm.")
+                    self.after(0, lambda: messagebox.showerror(
+                        "Eroare sincronizare",
+                        f"Nu am putut copia rezultatele înapoi pe server:\n{_e_sync}\n\n"
+                        f"Datele procesate rămân salvate local în:\n"
+                        f"{db_sync.get_local_cache_dir()}\n\n"
+                        f"Nu le pierde — anunță-mă ca să le recuperăm."))
+            self._release_lock()
 
         def abort(msg="⛔ Procesare anulata de utilizator."):
             self._log(f"\n{msg}")
@@ -1204,6 +1249,51 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
 
         try:
+            # ── Câte contoare distincte sunt implicate? (rapid, fără parsare
+            # completă) — decidem dacă merită copierea completă a bazei sau
+            # e mai ieftin să lucrăm direct pe rețea, scopat pe puține contoare.
+            _touched_ids = set()
+            for _p in self.selected_files:
+                try:
+                    _sid, _, _ = quick_scan_bin(_p, rescue_unknown=False)
+                    _touched_ids.add(_sid)
+                except Exception:
+                    pass
+            for _p in self.selected_log_files:
+                _touched_ids.add(os.path.splitext(os.path.basename(_p))[0].split("_")[0])
+            _n_touched = len(_touched_ids)
+
+            # ── Sincronizare: copiem baza de date local pentru viteză, DOAR
+            # dacă merită (multe contoare implicate). Pentru puține contoare,
+            # copierea completă (proporțională cu mărimea ÎNTREGII baze) costă
+            # mai mult decât lucrul direct pe rețea, scopat pe ce procesăm acum.
+            # (lacătul e deja al nostru — verificat înainte să pornească acest
+            # fir — deci suntem singurul utilizator activ acum).
+            if _n_touched < db_sync.LOCAL_COPY_THRESHOLD:
+                self._log(f"  ℹ {_n_touched} contor(oare) implicat(e) — sub pragul de "
+                          f"{db_sync.LOCAL_COPY_THRESHOLD}; lucrez direct pe rețea "
+                          f"(copierea completă a bazei nu s-ar amortiza).")
+                local_reports_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+                _sync_active = False
+            else:
+                try:
+                    db_sync.checkout_database(log=self._log)
+                    local_reports_dir = db_sync.prepare_local_reports_dir()
+                    _sync_active = True
+                except Exception as _e_checkout:
+                    # Peste prag, lucrul direct pe rețea înseamnă ore (≈38 s/contor)
+                    # și scrieri eșuate la „database is locked” — mai bine oprim
+                    # cu un mesaj clar decât să pornim o procesare care nu se termină.
+                    self._log(f"  ⛔ Copierea locală a bazei a eșuat ({_e_checkout}).\n"
+                              f"     Pentru {_n_touched} contoare, lucrul direct pe rețea ar dura "
+                              f"ore și ar eșua la scriere. Procesarea NU a pornit.\n"
+                              f"     Închide harta din browser, alte instanțe ale aplicației și "
+                              f"procesele python rămase, apoi reîncearcă.")
+                    self._update_progress(0, "⛔ Copierea bazei a eșuat.")
+                    self.after(0, lambda: self.btn_process.configure(state="normal"))
+                    self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
+                    return
+
             _t_run_start = time.perf_counter()
             _perf_phases = []
             _t_phase = _t_run_start
@@ -1233,7 +1323,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     sid, n_brut, n_lanes = quick_scan_bin(p)
                     fname = os.path.basename(p)
                     pct = int(2 + (idx / total) * 8)
-                    if n_brut == 0:
+                    if n_brut < 0:
+                        self._log(f"  ⚠  [{sid}]  {fname}  →  RO08: recordurile nu au putut fi localizate — rezultate nesigure")
+                        fisiere_goale += 1
+                    elif n_brut == 0:
                         self._log(f"  ⚠  [{sid}]  {fname}  →  fisier gol")
                         fisiere_goale += 1
                     else:
@@ -1256,19 +1349,27 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 _bin_proc_start = 10
                 _bin_proc_end   = int(bin_pct_end * 0.65)
 
-                def _bin_progress(site_id, n_ore, idx_ct, total_ct):
+                def _bin_progress(site_id, n_ore, idx_ct, total_ct, n_acum=None):
+                    # n_ore  = total ore ale contorului în SQLite (după scriere)
+                    # n_acum = ore scrise din fișierele procesate la această rulare
                     if cancelled(): return
                     pct = int(_bin_proc_start +
                               (idx_ct / total_ct) * (_bin_proc_end - _bin_proc_start))
                     self.after(0, lambda p=pct, s=site_id, n=n_ore, i=idx_ct, t=total_ct:
                         self._update_progress(
                             p, f"💾 SQLite+Excel [{s}]  {n:,} ore  ({i}/{t})"))
-                    self.after(0, lambda s=site_id, n=n_ore:
-                        self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare"))
+                    if n_acum is None:
+                        _msg = f"  💾 SQLite ← [{site_id}]  Total {n_ore:,} ore"
+                    else:
+                        _msg = (f"  💾 SQLite ← [{site_id}]  {n_acum:,} ore procesate acum"
+                                f" | Total {n_ore:,} ore")
+                    self.after(0, lambda m=_msg: self._log(m))
 
                 reset_ddp_perf()   # ⏱ instrumentare foaie "Date detaliate prelucrate"
+                reset_db_perf()    # ⏱ instrumentare SQLite (citire + scriere)
                 rezultate_bin = process_multiple_files(
                     self.selected_files,
+                    output_dir=local_reports_dir,
                     stop_event=self.stop_event,
                     progress_callback=_bin_progress,
                     warning_callback=self._log) or []
@@ -1278,6 +1379,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 _perf_phases.append(("Procesare + SQLite + Excel .bin", _now - _t_phase))
                 _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
                                       get_ddp_perf_seconds()))
+                _perf_phases.append(("  └─ din care: SQLite (citire + scriere)",
+                                      get_db_perf_seconds()))
+                for _lbl, _secs in get_db_perf_breakdown():
+                    _perf_phases.append((f"      · {_lbl}", _secs))
                 _t_phase = _now
 
                 if not rezultate_bin:
@@ -1331,29 +1436,36 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     "Se genereaza rapoartele Excel (.log)...")
                 self._log("  🔄 Generare rapoarte Excel (.log)...")
 
-                out_dir = os.path.join(CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER)
+                out_dir = local_reports_dir
                 os.makedirs(out_dir, exist_ok=True)
 
                 # ── Callback progres per contor .log ─────────────────────
                 _log_proc_start = log_pct_start + 5
                 _log_proc_end   = log_pct_start + 18
 
-                def _log_progress(site_id, n_ore, idx_ct, total_ct):
+                def _log_progress(site_id, n_ore, idx_ct, total_ct, n_acum=None):
+                    # n_ore = total ore VEK ale contorului în SQLite; n_acum = ore scrise acum
                     if cancelled(): return
                     pct = int(_log_proc_start +
                               (idx_ct / total_ct) * (_log_proc_end - _log_proc_start))
                     self.after(0, lambda p=pct, s=site_id, n=n_ore, i=idx_ct, t=total_ct:
                         self._update_progress(
                             p, f"💾 SQLite+Excel [{s}]  {n:,} ore VEK  ({i}/{t})"))
-                    self.after(0, lambda s=site_id, n=n_ore:
-                        self._log(f"  💾 SQLite ← [{s}]  {n:,} rânduri orare (VEK)"))
+                    if n_acum is None:
+                        _msg = f"  💾 SQLite ← [{site_id}]  Total {n_ore:,} ore (VEK)"
+                    else:
+                        _msg = (f"  💾 SQLite ← [{site_id}]  {n_acum:,} ore procesate acum"
+                                f" | Total {n_ore:,} ore (VEK)")
+                    self.after(0, lambda m=_msg: self._log(m))
 
                 reset_ddp_perf()   # ⏱ instrumentare foaie "Date detaliate prelucrate"
+                reset_db_perf()    # ⏱ instrumentare SQLite (citire + scriere)
                 rezultate_log = process_log_files(
                     self.selected_log_files,
                     output_dir=out_dir,
                     stop_event=self.stop_event,
-                    progress_callback=_log_progress) or []
+                    progress_callback=_log_progress,
+                    warning_callback=self._log) or []
 
                 if self.stop_event.is_set(): abort(); return
 
@@ -1361,6 +1473,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 _perf_phases.append(("Procesare + SQLite + Excel .log", _now - _t_phase))
                 _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
                                       get_ddp_perf_seconds()))
+                _perf_phases.append(("  └─ din care: SQLite (citire + scriere)",
+                                      get_db_perf_seconds()))
+                for _lbl, _secs in get_db_perf_breakdown():
+                    _perf_phases.append((f"      · {_lbl}", _secs))
                 _t_phase = _now
 
                 if not rezultate_log:
@@ -1438,13 +1554,14 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 lines.append(f"📦 .LOG — {len(rezultate_log)} contoar{'e' if len(rezultate_log)!=1 else ''}  "
                              f"({sum(r['randuri'] for r in rezultate_log):,} ore)")
             lines.append(f"\nRaport{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{rapoarte_dir}")
+            sync_and_release()
             self.after(0, lambda: messagebox.showinfo("Succes", "\n".join(lines)))
 
         except Exception as ex:
             self._log(f"\n✗ Eroare neasteptata: {ex}")
             self._update_progress(0, "✗  Eroare procesare.")
         finally:
-            self._release_lock()
+            sync_and_release()   # nu face nimic dacă a rulat deja mai sus
             self.after(0, lambda: self.btn_process.configure(state="normal"))
             self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
             self.after(0, lambda: setattr(self, "selected_files", []))
@@ -1514,9 +1631,9 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
         win.title("Gestionare Contoare")
         win.resizable(True, True)
-        win.minsize(1000, 460)
-        W, H = 1150, 580
         sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+        W, H = 1150, min(800, sh - 90)
+        win.minsize(1000, min(560, sh - 90))
         win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
         win.grab_set()
         win.focus_force()
@@ -1545,11 +1662,11 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                   background=[("selected", "#2471A3")],
                   foreground=[("selected", "white")])
 
-        cols = ("Contor", "Drum", "Poziție km", "Localitate", "Tip", "IP",
-                "DRDP", "Lat", "Lng")
+        cols = ("Activ", "Contor", "Drum", "Poziție km", "Localitate", "Tip",
+                "IP", "DRDP", "Lat", "Lng")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                             height=14, style="Peek.Treeview")
-        cw = {"Contor": 70, "Drum": 85, "Poziție km": 80,
+        cw = {"Activ": 60, "Contor": 70, "Drum": 85, "Poziție km": 80,
               "Localitate": 130, "Tip": 160, "IP": 115,
               "DRDP": 90, "Lat": 95, "Lng": 95}
         for c in cols:
@@ -1562,15 +1679,24 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         vsb.pack(side="right",  fill="y")
         hsb.pack(side="bottom", fill="x")
         tree.pack(fill="both", expand=True)
+        tree.tag_configure("inactiv", foreground="#9AA0A6")
 
-        if CTK_AVAILABLE:
-            ctk.CTkFrame(win, height=1, fg_color="#CCCCCC").pack(fill="x", padx=16, pady=(6, 4))
-        else:
-            ttk.Separator(win, orient="horizontal").pack(fill="x", padx=16, pady=(6, 4))
+        lbl_activi = _ctk_label(
+            win, "", font=FONT_SMALL, text_color="#999999")
+        lbl_activi.pack(pady=(2, 0))
+
+        _sep = (ctk.CTkFrame(win, height=1, fg_color="#CCCCCC") if CTK_AVAILABLE
+                else ttk.Separator(win, orient="horizontal"))
 
         # Butoane scalabile
         btn_outer = ctk.CTkFrame(win, fg_color="transparent") if CTK_AVAILABLE else tk.Frame(win)
-        btn_outer.pack(fill="x", padx=16, pady=(0, 14))
+        # Butoanele/separatorul/contorul sunt ancorate JOS (înaintea tabelului
+        # în ordinea pack) — tabelul cedează spațiu, butoanele nu mai dispar
+        # când fereastra e mică.
+        btn_outer.pack(side="bottom", fill="x", padx=16, pady=(0, 14), before=tree_frame)
+        _sep.pack(side="bottom", fill="x", padx=16, pady=(6, 4), before=tree_frame)
+        lbl_activi.pack_forget()
+        lbl_activi.pack(side="bottom", pady=(2, 0), before=tree_frame)
         for col in range(4):
             btn_outer.columnconfigure(col, weight=1, uniform="mgr")
 
@@ -1600,7 +1726,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             # Citim din SQLite — sursa principală (are DRDP/lat/lng)
             try:
                 from database import get_contoare_db, CONTOARE_DB
-                db_sql = get_contoare_db().get_all()
+                db_sql = get_contoare_db().get_all(include_inactive=True)
             except Exception:
                 db_sql = {}
             # Fallback: completăm cu contoare din Excel care nu sunt încă în SQLite
@@ -1630,7 +1756,11 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             for ct in ct_ids:
                 d = db_sql.get(ct) or db_excel.get(ct) or {}
-                tree.insert("", "end", values=(
+                _activ = d.get("Activ", 1) != 0
+                tree.insert("", "end", iid=ct,
+                            tags=(() if _activ else ("inactiv",)),
+                            values=(
+                    "☑" if _activ else "☐",
                     ct,
                     d.get("Drum","") or d.get("drum",""),
                     d.get("Pozitie_km","") or d.get("pozitie_km",""),
@@ -1641,6 +1771,56 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                     _fmt_coord(d.get("lat") or d.get("Lat") or ""),
                     _fmt_coord(d.get("lng") or d.get("Lng") or ""),
                 ))
+            _update_count()
+
+        def _update_count():
+            tot = len(tree.get_children())
+            act = sum(1 for i in tree.get_children()
+                      if tree.set(i, "Activ") == "☑")
+            lbl_activi.configure(
+                text=f"Active (afișate pe hartă): {act} / {tot}   "
+                     f"—  click pe ☑/☐ din coloana „Activ” sau Space")
+
+        def _toggle_activ(ct_id):
+            """Comută Activ pentru un contor și salvează imediat în contoare.db."""
+            nou = tree.set(ct_id, "Activ") != "☑"
+            try:
+                from database import get_contoare_db
+                cdb = get_contoare_db()
+                if not cdb.get(ct_id):
+                    # contor existent doar în Excel — îl creăm întâi în SQLite
+                    cdb.upsert(ct_id, _get_contor_data_merged(ct_id))
+                cdb.set_activ(ct_id, nou)
+            except Exception as _e:
+                messagebox.showerror(
+                    "Eroare", f"Nu am putut salva starea contorului {ct_id}:\n{_e}",
+                    parent=win)
+                return
+            tree.set(ct_id, "Activ", "☑" if nou else "☐")
+            tree.item(ct_id, tags=(() if nou else ("inactiv",)))
+            self._log(f"  {'✅' if nou else '⏸'}  Contor {ct_id} marcat "
+                      f"{'ACTIV' if nou else 'INACTIV'} (harta se actualizează la reîncărcare).")
+            _update_count()
+
+        def _on_tree_click(event):
+            if tree.identify_region(event.x, event.y) != "cell":
+                return
+            if tree.identify_column(event.x) != "#1":
+                return
+            iid = tree.identify_row(event.y)
+            if iid:
+                _toggle_activ(iid)
+                return "break"
+
+        def _on_tree_space(event):
+            for iid in tree.selection():
+                _toggle_activ(iid)
+            return "break"
+
+        def _on_tree_double(event):
+            if tree.identify_column(event.x) == "#1":
+                return          # dublu-click pe bifă ≠ deschide Editează
+            on_editeaza()
 
         def on_adauga():
             _open_contor_dialog(win, mode="add", on_save=refresh_tree, app_ref=self)
@@ -1650,8 +1830,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             if not sel:
                 messagebox.showwarning("Atenție", "Selectează un contoar!", parent=win)
                 return
-            vals = tree.item(sel[0])["values"]
-            ct_id = str(vals[0])
+            ct_id = sel[0]          # iid = codul contorului (păstrează zerourile)
             _open_contor_dialog(win, mode="edit", ct_id=ct_id,
                                 data=_get_contor_data_merged(ct_id),
                                 on_save=refresh_tree, app_ref=self)
@@ -1661,9 +1840,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             if not sel:
                 messagebox.showwarning("Atenție", "Selectează un contoar!", parent=win)
                 return
-            vals = tree.item(sel[0])["values"]
-            ct_id = str(vals[0])
-            msg = f"Ești sigur că vrei să ștergi contoarul {ct_id}?"
+            ct_id = sel[0]          # iid = codul contorului (păstrează zerourile)
+            msg = (f"Ești sigur că vrei să ȘTERGI definitiv contoarul {ct_id}?\n\n"
+                   f"(Dacă vrei doar să nu mai apară pe hartă, debifează-l "
+                   f"în coloana „Activ”.)")
             if messagebox.askyesno("Confirmare ștergere", msg, parent=win):
                 db = _load_contoare_db()
                 if ct_id in db:
@@ -1689,7 +1869,9 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             b.grid(row=0, column=col, padx=5, pady=6, sticky="ew")
 
         refresh_tree()
-        tree.bind("<Double-1>", lambda e: on_editeaza())
+        tree.bind("<Button-1>", _on_tree_click)
+        tree.bind("<space>", _on_tree_space)
+        tree.bind("<Double-1>", _on_tree_double)
 
     # ── Procesare manuală MZL ─────────────────────────────────────────────────
     def _open_mzl_manual_dialog(self):
@@ -2250,6 +2432,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 # ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # necesar pentru procesele worker in .exe (PyInstaller) pe Windows
     if not CTK_AVAILABLE:
         print("[WARN] customtkinter nu este instalat.")
         print("       Ruleaza:  pip install customtkinter")

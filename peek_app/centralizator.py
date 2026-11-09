@@ -30,6 +30,24 @@ from config import (
 )
 from database import get_contoare_db
 
+# ── Cronometrare internă (afișează în consolă unde se duce timpul) ───────────
+import time as _time
+_tk_state = {"t0": 0.0, "last": 0.0}
+
+def _tk_reset():
+    _tk_state["t0"] = _tk_state["last"] = _time.perf_counter()
+
+def _tk(label):
+    now = _time.perf_counter()
+    print(f"[CENTRALIZATOR ⏱] {label:<52}{now - _tk_state['last']:8.1f}s", flush=True)
+    _tk_state["last"] = now
+
+def _tk_total():
+    print(f"[CENTRALIZATOR ⏱] {'TOTAL centralizator':<52}"
+          f"{_time.perf_counter() - _tk_state['t0']:8.1f}s", flush=True)
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PASUL 1 — această funcție trebuie să fie ÎNAINTE de update_centralizator
 # ══════════════════════════════════════════════════════════════════════════════
@@ -40,16 +58,21 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
     luna_map = {'Ian':1,'Feb':2,'Mar':3,'Apr':4,'Mai':5,'Iun':6,
                 'Iul':7,'Aug':8,'Sep':9,'Oct':10,'Noi':11,'Dec':12}
 
-    wb = openpyxl.load_workbook(excel_path, data_only=True)
-    ws = wb["Media Zilnica Lunara"]
+    # read_only=True: openpyxl parsează DOAR foaia cerută (nu și "Date Detaliate",
+    # care are zeci de mii de rânduri). Rândurile se citesc o singură dată cu
+    # iter_rows — în modul read_only, ws.cell(r, c) ar fi foarte lent.
+    wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        rows = list(wb["Media Zilnica Lunara"].iter_rows(values_only=True))
+    finally:
+        wb.close()
 
-    header_row = None
+    header_idx = None
     col_map    = {}
 
-    for r in range(1, ws.max_row + 1):
+    for r_i, row in enumerate(rows):
         row_data = {}
-        for c in range(1, ws.max_column + 1):
-            val = ws.cell(r, c).value
+        for c, val in enumerate(row, 1):
             if val is not None:
                 key = str(val).strip()
                 if key not in row_data:
@@ -58,12 +81,11 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
         an_col_found   = row_data.get("An",   999)
         luna_col_found = row_data.get("Luna", 999)
         if an_col_found <= 10 and luna_col_found <= 10:
-            header_row = r
+            header_idx = r_i
             col_map    = row_data
             break
 
-    if header_row is None:
-        wb.close()
+    if header_idx is None:
         raise RuntimeError(
             f"Nu am găsit headerul 'An'+'Luna' în 'Media Zilnica Lunara' "
             f"al fișierului {excel_path}")
@@ -90,26 +112,26 @@ def _read_lunar_sheet_from_report(excel_path, site_id):
               'Total', 'Indicator', 'Mod de funcționare', 'Zile cu înregistrări']
     present_cols = {k: v for k, v in col_map.items() if k in wanted}
 
+    def _cell(row, c):
+        return row[c - 1] if c - 1 < len(row) else None
+
+    an_col   = present_cols.get('An')
+    luna_col = present_cols.get('Luna')
+
     rows_out = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        an_col   = present_cols.get('An')
-        luna_col = present_cols.get('Luna')
-        if not an_col or not luna_col:
-            continue
+    if an_col and luna_col:
+        for row in rows[header_idx + 1:]:
+            an_val   = to_an(_cell(row, an_col))
+            luna_val = to_luna(_cell(row, luna_col))
 
-        an_val   = to_an(ws.cell(r, an_col).value)
-        luna_val = to_luna(ws.cell(r, luna_col).value)
+            if an_val is None or luna_val is None:
+                continue
 
-        if an_val is None or luna_val is None:
-            continue
-
-        row_dict = {'Contor': str(site_id), 'An': an_val, 'Luna': luna_val}
-        for col_name, col_idx in present_cols.items():
-            if col_name not in ('An', 'Luna'):
-                row_dict[col_name] = ws.cell(r, col_idx).value
-        rows_out.append(row_dict)
-
-    wb.close()
+            row_dict = {'Contor': str(site_id), 'An': an_val, 'Luna': luna_val}
+            for col_name, col_idx in present_cols.items():
+                if col_name not in ('An', 'Luna'):
+                    row_dict[col_name] = _cell(row, col_idx)
+            rows_out.append(row_dict)
 
     if not rows_out:
         raise RuntimeError(
@@ -192,6 +214,7 @@ def _write_centralizator_file(df_final, _last_user):
         print(f"[WARN] Nu am putut citi contoare.db: {_e_cdb}. Sheet 'Contoare' va fi gol.")
         db_contoare_snapshot = {}
 
+    _tk("w4 pregătire (contoare.db get_all)")
     # ── 5. Scriere Excel ──────────────────────────────────────────────────────
     with pd.ExcelWriter(CENTRAL_FILE, engine="openpyxl") as writer:
         df_final.to_excel(writer, sheet_name="Media Zilnica Lunara", index=False)
@@ -249,6 +272,9 @@ def _write_centralizator_file(df_final, _last_user):
             if cell.value and str(cell.value).strip() in num_headers:
                 num_cols.add(cell.column)
 
+        # ws.max_column parcurge TOATE celulele foii la fiecare apel — în buclă pe
+        # rânduri devenea pătratic (~160 s la ~13.000 rânduri). Se calculează o dată.
+        _ws_max_col = ws.max_column
         for r in range(3, ws.max_row + 1):
             ct_val   = str(ws.cell(r, contor_col_idx).value) if contor_col_idx else ""
             row_fill = fill(contor_colors.get(ct_val, C_LIGHT))
@@ -262,7 +288,7 @@ def _write_centralizator_file(df_final, _last_user):
                 elif "Nu există" in ind_val:
                     row_fill = fill(C_ORANGE)
 
-            for c in range(1, ws.max_column + 1):
+            for c in range(1, _ws_max_col + 1):
                 cell = ws.cell(r, c)
                 cell.font      = dfont(9)
                 cell.fill      = row_fill
@@ -292,6 +318,7 @@ def _write_centralizator_file(df_final, _last_user):
 
         ws.freeze_panes = "A3"
 
+        _tk("w5 foaia Media Zilnica Lunara (to_excel+stil)")
         # ════════════════════════════════════════════════════════════════════
         # SHEET "Contoare" — 9 coloane: Contor, Drum, Poziție km, Localitate,
         #                     Tip, IP, Lat, Lng, DRDP  (sursa: contoare.db)
@@ -355,6 +382,7 @@ def _write_centralizator_file(df_final, _last_user):
 
         ws_contoare.freeze_panes = "A2"
 
+        _tk("w6 foaia Contoare")
         # ════════════════════════════════════════════════════════════════════
         # SHEET „Prelucrare manuala" — istoric complet din SQLite (read-only)
         # ════════════════════════════════════════════════════════════════════
@@ -547,6 +575,7 @@ def _write_centralizator_file(df_final, _last_user):
 
         ws_pm.freeze_panes = "A4"
 
+        _tk("w7 foaia Prelucrare manuala (SQL)")
         # ════════════════════════════════════════════════════════════════════
         # SHEET "Analiza" — dropdown legat dinamic de sheet-ul "Contoare"
         # ════════════════════════════════════════════════════════════════════
@@ -804,6 +833,7 @@ def _write_centralizator_file(df_final, _last_user):
             sh.sheet_view.tabSelected = (sh.title == "Analiza")
         wb.active = wb["Analiza"]
 
+        _tk("w8 foaia Analiza (+grafice)")
         # ════════════════════════════════════════════════════════════════════
         # SHEET "Reguli Calcul" în Centralizator
         # ════════════════════════════════════════════════════════════════════
@@ -889,6 +919,7 @@ def _write_centralizator_file(df_final, _last_user):
 
 
 
+    _tk("w9 Reguli Calcul + SALVARE xlsx (ieșire din with)")
     # ── Backup automat după scriere ───────────────────────────────────────────
     # Salvează o copie în: CENTRAL_FILE_FOLDER\Istoric Procesari\
     # Numele fișierului conține data în format zz-ll-aaaa, ex:
@@ -908,6 +939,7 @@ def _write_centralizator_file(df_final, _last_user):
         pass  # backup eșuat nu oprește procesarea
     # ─────────────────────────────────────────────────────────────────────────
 
+    _tk("w10 backup în Istoric Procesari")
     return CENTRAL_FILE
 
 
@@ -933,6 +965,7 @@ def update_centralizator_batch(rezultate, central_folder, log_callback=None):
     """
     os.makedirs(CENTRAL_FILE_FOLDER, exist_ok=True)
     CENTRAL_FILE = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+    _tk_reset()
 
     # ── 0. Ultimul utilizator care a salvat fișierul (o singură citire) ────────
     _last_user = ""
@@ -951,6 +984,7 @@ def update_centralizator_batch(rezultate, central_folder, log_callback=None):
         except Exception:
             _last_user = "Necunoscut"
 
+    _tk("b0 meta fișier central (read_only)")
     # ── 1. Date noi din TOATE rapoartele, izolat per contor ─────────────────
     # O eroare la citirea unui raport individual nu oprește restul batch-ului.
     df_new_list = []
@@ -974,6 +1008,7 @@ def update_centralizator_batch(rezultate, central_folder, log_callback=None):
 
     df_new = pd.concat(df_new_list, ignore_index=True)
 
+    _tk(f"b1 citire {len(rezultate)} rapoarte individuale")
     # ── 2. Citire date persistente din sheet-ul "Media Zilnica Lunara" ─────────
     # La fel ca în update_centralizator(), dar excludem TOATE contoarele din
     # batch deodată (nu doar unul), pentru că vor fi rescrise cu datele noi.
@@ -1033,6 +1068,7 @@ def update_centralizator_batch(rezultate, central_folder, log_callback=None):
     else:
         df_final = df_new
 
+    _tk("b2 citire fișier central existent (load complet)")
     # ── 3. Sortare ────────────────────────────────────────────────────────────
     for col in ['An', 'Luna']:
         if col in df_final.columns:
@@ -1041,8 +1077,10 @@ def update_centralizator_batch(rezultate, central_folder, log_callback=None):
         [c for c in ['Contor', 'An', 'Luna'] if c in df_final.columns]
     ).reset_index(drop=True)
 
+    _tk("b3 sortare")
     # ── 4+. Scriere efectivă — O SINGURĂ DATĂ pentru tot batch-ul ──────────────
     _write_centralizator_file(df_final, _last_user)
+    _tk_total()
 
     return CENTRAL_FILE, erori
 

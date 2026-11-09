@@ -55,11 +55,13 @@ def add_ddp_perf(seconds):
 
 def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source_file_periods=None,
                               mzl_manual=None, live_sources=None, localitate_site=None,
-                              db_writes=None):
+                              db_writes=None, contor_info=None):
     # Parametri opționali pentru rularea în proces worker (fără acces la SQLite):
     #   mzl_manual      dict {(an, luna): mzl} citit dinainte de procesul principal
     #   live_sources    rezultatul get_source_files_periods(site_id), citit dinainte
     #   localitate_site text gata calculat (" - Localitate" sau "")
+    #   contor_info     dict {"Tip": "...", "IP": "..."} gata calculat de
+    #                   precompute_contor_info() (None = nu se afișează)
     #   db_writes       listă în care se COLECTEAZĂ scrierile în trafic_mzl/trafic_mza
     #                   (procesul principal le aplică). None = scrie direct (vechiul mod).
     MIN_ORE_ZI    = 22
@@ -277,7 +279,14 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     # Titlu dinamic care acoperă toate coloanele
     title_end_col = get_column_letter(n_total_cols)
     ws2.merge_cells(f"A1:{title_end_col}1")
-    ws2["A1"] = f"REZUMAT ZILNIC  |  Contor: {site_id}{localitate_site}  |  {first_date} – {last_date}"
+    _info_txt = ""
+    if contor_info:
+        if contor_info.get("Tip"):
+            _info_txt += f"  |  Tip: {contor_info['Tip']}"
+        if contor_info.get("IP"):
+            _info_txt += f"  |  IP: {contor_info['IP']}"
+    ws2["A1"] = (f"REZUMAT ZILNIC  |  Contor: {site_id}{localitate_site}{_info_txt}"
+                 f"  |  {first_date} – {last_date}")
     ws2["A1"].font = Font(name='Arial', size=13, bold=True, color=C_WHITE)
     ws2["A1"].fill = fill(C_DARK)
     ws2["A1"].alignment = ctr()
@@ -542,23 +551,37 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
         pie_chart = make_pie(f"Distribuție clase — Banda {b}  (ult. 30 zile)", val_col, n_clase)
         ws2.add_chart(pie_chart, anchor)
 
+    # ── Chart distribuție procentuală — ultimele 30 zile valide (ca pie-urile) ──
+    # Datele auxiliare se scriu sub tabelul pie, în aceleași coloane
+    # (acoperite de grafice, ca și datele pie).
+    n_pie_days = len(dc_pie)
+    AUX2_HDR_ROW = PIE_START_ROW + n_clase + 1
+    ws2.cell(AUX2_HDR_ROW, lbl_col, "Data").font = dfont(bold=True)
+    for b in band_ids:
+        ws2.cell(AUX2_HDR_ROW, PIE_AUX_START_COL + b, f"Total Banda {b}").font = dfont(bold=True)
+    for k, (_, r_) in enumerate(dc_pie.iterrows(), 1):
+        ws2.cell(AUX2_HDR_ROW + k, lbl_col, r_['Zi'].strftime("%d.%m.%Y"))
+        for b in band_ids:
+            ws2.cell(AUX2_HDR_ROW + k, PIE_AUX_START_COL + b, int(r_.get(f'Total_B{b}', 0)))
+
     chart2 = BarChart()
     chart2.type = "col"; chart2.grouping = "percentStacked"; chart2.overlap = 100
-    chart2.title = f"Distribuție procentuală {'  /  '.join([f'Banda {b}' for b in band_ids])}"
+    chart2.title = (f"Distribuție procentuală {'  /  '.join([f'Banda {b}' for b in band_ids])}"
+                    f"  (ult. 30 zile)")
     chart2.y_axis.title = "Procent (%)"; chart2.style = 10
-    chart2.width = latime_dinamica; chart2.height = 12
+    chart2.width = max(20, n_pie_days * 0.6); chart2.height = 12
     chart2.legend.position = 'b'; chart2.legend.overlay = False
     configure_x_axis(chart2.x_axis)
     chart2.layout = make_bar_layout()
 
-    # Date pentru chart: coloanele Total_BX din ws2
     for bi, b in enumerate(band_ids):
-        col_idx = total_b_start_col + bi
-        ref = Reference(ws2, min_col=col_idx, min_row=2, max_row=2 + n_days)
+        ref = Reference(ws2, min_col=PIE_AUX_START_COL + b,
+                        min_row=AUX2_HDR_ROW, max_row=AUX2_HDR_ROW + n_pie_days)
         chart2.add_data(ref, titles_from_data=True)
         chart2.series[bi].graphicalProperties.solidFill = BAND_COLORS[bi % len(BAND_COLORS)]
 
-    cats_all = Reference(ws2, min_col=1, min_row=3, max_row=2 + n_days)
+    cats_all = Reference(ws2, min_col=lbl_col,
+                         min_row=AUX2_HDR_ROW + 1, max_row=AUX2_HDR_ROW + n_pie_days)
     chart2.set_categories(cats_all)
     ws2.add_chart(chart2, bar_anchor)
 
@@ -571,7 +594,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
     CLASE_IDX = list(range(1, 9)) + [15]
     PERECHI = {2: {1:2,2:1}, 4: {1:4,2:3,3:2,4:1}, 6: {1:6,2:5,3:4,4:3,5:2,6:1}}
     perechi = PERECHI.get(n_bands, PERECHI[2])
-    PRAG_TOT_DP = 0.10
+    PRAG_TOT_DP = 0.99
 
     def _sb(tot_b, cls15_b):
         if tot_b == 0: return 'D'
@@ -750,7 +773,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                             _db = _bfs[0]; _rb = perechi[_db]
                             if _rtot[_rb] > 0:
                                 _sc = (_rtot[_pb] / _rtot[_rb]) * _rtot[_db]
-                                _ocls[_b] = _scale(_rcls[_db], _rtot[_db], round(_sc))
+                                _ocls[_b] = _recon(_rcls[_pb], _rtot[_pb], round(_sc))
                                 _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
                             else:
                                 _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
@@ -764,17 +787,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                     _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_pb]) for _c in CLASE_IDX}
                     _otot[_b] = _rtot[_pb]; _osrc[_b] = 'T'; _tip_zi = 'totalizator'
 
-                else:  # pb == D, ambele defecte → caută alt sens
-                    _ss_b = SENS1_B if _b in SENS1_B else SENS2_B
-                    _af = [_x for _x in _ss_b if _x != _b and _stat[_x] in ('C','T')]
-                    if _af:
-                        _xb = _af[0]; _xpb = perechi[_xb]
-                        if _stat[_xb] == 'C' and _stat[_xpb] == 'C' and _rtot[_xb] > 0:
-                            _ocls[_b] = _copy(_rcls[_xb]); _otot[_b] = _rtot[_xb]; _osrc[_b] = 'R'
-                        else:
-                            _null_zi = True; _ocls[_b] = {_c:0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
-                    else:
-                        _null_zi = True; _ocls[_b] = {_c:0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+                else:  # pb == D, ambele defecte → zi neutilizabilă (fără căutare în alte benzi)
+                    _null_zi = True; _ocls[_b] = {_c:0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
 
         if _null_zi: _tip_zi = 'null'
         _dp_tip_zi_map[_zi_date] = _tip_zi
@@ -957,7 +971,7 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                             _db = _bfs[0]; _rb = perechi[_db]
                             if _rtot[_rb] > 0:
                                 _sc = (_rtot[_pb] / _rtot[_rb]) * _rtot[_db]
-                                _ocls[_b] = _scale(_rcls[_db], _rtot[_db], round(_sc))
+                                _ocls[_b] = _recon(_rcls[_pb], _rtot[_pb], round(_sc))
                                 _otot[_b] = sum(_ocls[_b].values()); _osrc[_b] = 'R'
                             else:
                                 _ocls[_b] = _copy(_rcls[_pb]); _otot[_b] = _rtot[_pb]; _osrc[_b] = 'R'
@@ -970,17 +984,8 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
                     _ocls[_b] = {_c: (0 if _c != 15 else _rtot[_pb]) for _c in CLASE_IDX}
                     _otot[_b] = _rtot[_pb]; _osrc[_b] = 'T'; _tip_int = 'totalizator'
 
-                else:  # ambele bande D → caută altă bandă din același sens
-                    _ss_b = SENS1_B if _b in SENS1_B else SENS2_B
-                    _af = [_x for _x in _ss_b if _x != _b and _stat[_x] in ('C', 'T')]
-                    if _af:
-                        _xb = _af[0]; _xpb = perechi[_xb]
-                        if _stat[_xb] == 'C' and _stat[_xpb] == 'C' and _rtot[_xb] > 0:
-                            _ocls[_b] = _copy(_rcls[_xb]); _otot[_b] = _rtot[_xb]; _osrc[_b] = 'R'
-                        else:
-                            _null_int = True; _ocls[_b] = {_c: 0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
-                    else:
-                        _null_int = True; _ocls[_b] = {_c: 0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
+                else:  # ambele bande D → interval neutilizabil (fără căutare în alte benzi)
+                    _null_int = True; _ocls[_b] = {_c: 0 for _c in CLASE_IDX}; _otot[_b] = 0; _osrc[_b] = 'N'
 
         if _null_int: _tip_int = 'null'
 
@@ -2244,11 +2249,11 @@ def add_charts_and_formatting(excel_path, df, site_id, source_files=None, source
              "Benzii T i se redistribuie clasele în proporțiile benzii pereche C, "
              "rotunjit la număr întreg."),
             ("Reconstituire D din C", "D=pereche", "toate clasele",
-             "Banda D preia direct toate clasele benzii pereche C. "
-             "Dacă ambele benzi sunt D → se caută altă bandă din același sens."),
-            ("Zi neutilizabilă", "ambele D", "sens lipsă",
-             "Dacă nu se poate reconstitui cel puțin un sens → ziua e marcată Neutilizabil "
-             "și exclusă din MZL și MZA."),
+             "Banda D preia direct toate clasele benzii pereche C."),
+            ("Zi neutilizabilă", "ambele D", "bandă + pereche",
+             "Dacă o bandă este D și perechea ei este tot D → ziua (în „Date prelucrate”) "
+             "sau intervalul orar (în „Date detaliate prelucrate”) este marcat Neutilizabil "
+             "și exclus din MZL și MZA."),
             # ── Secțiunea 3: MZL — calcul Total (toate cazurile) ─────────────
             ("─── MZL — CALCUL TOTAL (Media Zilnică Lunară) ───", "", "", ""),
             ("Formulă generală", "Σ Total_zi / n_zile_valide", "vehicule/zi",
@@ -2567,6 +2572,35 @@ def precompute_localitati(site_ids):
     return out
 
 
+def precompute_contor_info(site_ids):
+    """Citește foaia 'Contoare' din centralizator O SINGURĂ DATĂ și întoarce
+    {site_id: {"Tip": "...", "IP": "..."}}. Aceeași potrivire ca în
+    precompute_localitati. La eroare întoarce {} (workerul primește None)."""
+    out = {}
+    try:
+        path_c = os.path.join(CENTRAL_FILE_FOLDER, CENTRAL_FILE_NAME)
+        if not os.path.exists(path_c):
+            return {}
+        df_c = pd.read_excel(path_c, sheet_name='Contoare', dtype=str)
+        col0 = df_c.iloc[:, 0].astype(str)
+
+        def _cell(row, idx):
+            if idx >= len(row):
+                return ""
+            v = row.iloc[idx]
+            return "" if pd.isna(v) else str(v).strip()
+
+        for sid in site_ids:
+            match = df_c[col0.str.contains(str(sid))]
+            if not match.empty:
+                m = match.iloc[0]
+                out[str(sid)] = {"Tip": _cell(m, 4), "IP": _cell(m, 5)}
+    except Exception as e:
+        print(f"Atenție: Nu s-au putut citi tipul/IP-ul din centralizator: {e}")
+        return {}
+    return out
+
+
 def apply_db_writes(writes):
     """Aplică în procesul principal scrierile colectate de workeri."""
     if not writes:
@@ -2590,7 +2624,8 @@ def build_counter_report_task(job):
     Scrie întâi într-un fișier temporar și abia la final îl înlocuiește pe cel
     real (os.replace) — o anulare/cădere nu lasă rapoarte pe jumătate scrise.
     job: site_id, output_fn, tmp_fn, df, has_traffic, zero_msg, source_files,
-         source_file_periods, mzl_manual, live_sources, localitate_site
+         source_file_periods, mzl_manual, live_sources, localitate_site,
+         contor_info (opțional, din precompute_contor_info)
     """
     reset_ddp_perf()
     site_id = job["site_id"]
@@ -2612,6 +2647,7 @@ def build_counter_report_task(job):
             mzl_manual=job["mzl_manual"],
             live_sources=job["live_sources"],
             localitate_site=job["localitate_site"],
+            contor_info=job.get("contor_info"),
             db_writes=writes,
         )
     else:

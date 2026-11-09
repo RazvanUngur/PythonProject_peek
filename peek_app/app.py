@@ -35,7 +35,7 @@ from bin_parser import quick_scan_bin, process_multiple_files
 from log_parser import process_log_files
 from centralizator import update_centralizator, update_centralizator_batch
 from excel_report import reset_ddp_perf, get_ddp_perf_seconds
-from parallel_utils import reset_db_perf, get_db_perf_seconds, get_db_perf_breakdown
+from parallel_utils import reset_db_perf, get_db_perf_seconds, get_db_perf_breakdown, get_worker_count
 import db_sync
 from contoare_db import _load_contoare_db, _save_contoare_db, _delete_contor_from_centralizator
 from gui_widgets import (
@@ -45,18 +45,42 @@ from gui_widgets import (
 
 from harta_server import HartaServer
 
+def _perf_workers(n_jobs):
+    """Numărul de procese worker folosite efectiv la procesare (pentru raportul
+    de performanță). Folosește aceeași funcție ca procesarea reală
+    (parallel_utils.get_worker_count), deci respectă CESTRIN_WORKERS,
+    config.MAX_WORKERS și limita min(nuclee-1, 6)."""
+    n_jobs = max(1, int(n_jobs or 1))
+    try:
+        return max(1, int(get_worker_count(n_jobs)))
+    except Exception:
+        return 1
+
+
 def _format_perf_summary(phases, total_seconds):
     """
     Genereaza un raport scurt: unde s-a dus timpul in timpul procesarii.
-    phases: lista de tuple (eticheta, secunde)
+    phases: lista de tuple (eticheta, secunde) sau (eticheta, secunde, n_workeri).
+    Cand n_workeri > 1, "secunde" este timp CPU CUMULAT peste toti workerii
+    (poate depasi timpul de perete). Atunci afisam timpul efectiv estimat
+    (cumulat / n_workeri) si procentul fata de timpul total, iar timpul
+    cumulat ramane vizibil in paranteza.
     """
     if not phases or total_seconds <= 0:
         return "     (fara date de performanta)"
-    max_label = max(len(lbl) for lbl, _ in phases)
+    max_label = max(len(ph[0]) for ph in phases)
     linii = []
-    for lbl, secs in phases:
-        pct = (secs / total_seconds) * 100 if total_seconds else 0
-        linii.append(f"     {lbl.ljust(max_label)}   {secs:7.1f}s   ({pct:5.1f}%)")
+    for ph in phases:
+        lbl, secs = ph[0], ph[1]
+        n_w = ph[2] if len(ph) > 2 else 1
+        if n_w and n_w > 1:
+            ef = secs / n_w
+            pct = (ef / total_seconds) * 100 if total_seconds else 0
+            linii.append(f"     {lbl.ljust(max_label)}   {ef:7.1f}s   ({pct:5.1f}%)"
+                         f"   [CPU cumulat {secs:.1f}s / {n_w} workeri]")
+        else:
+            pct = (secs / total_seconds) * 100 if total_seconds else 0
+            linii.append(f"     {lbl.ljust(max_label)}   {secs:7.1f}s   ({pct:5.1f}%)")
     linii.append(f"     {'TOTAL'.ljust(max_label)}   {total_seconds:7.1f}s   (100.0%)")
     return "\n".join(linii)
 
@@ -495,8 +519,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         _row_cale(form, "Folder posturi:", var_dest,  1)
 
         _ctk_label(form,
-                   "  ℹ️  Fișierele .bin din sursă vor fi mutate în subfolderele\n"
-                   "      de forma  XXXX_Localitate  din folderul posturi.",
+                   "  ℹ️  Se caută .bin și în subfoldere. Fișierele sunt mutate în  XXXX_Localitate\n"
+                   "      din folderul posturi; restul merg în  \"fara folder\".",
                    font=FONT_SMALL, text_color="#555555").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
@@ -584,6 +608,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
         def _run_sortare(sursa, dest):
             import shutil
 
+            FOLDER_FARA = "fara folder"
+
             def _extrage_site_id(filepath):
                 try:
                     with open(filepath, "rb") as f:
@@ -599,6 +625,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 except Exception as e:
                     return None
 
+            def _same_dir(a, b):
+                return (os.path.normcase(os.path.abspath(a)) ==
+                        os.path.normcase(os.path.abspath(b)))
+
             # Construim map cod -> folder destinatie
             folder_map = {}
             for entry in os.scandir(dest):
@@ -609,12 +639,19 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             win.after(0, lambda: _log_win(
                 f"{'─'*55}\n"
-                f"  Sursă:    {sursa}\n"
+                f"  Sursă:    {sursa}  (inclusiv subfoldere)\n"
                 f"  Posturi:  {dest}\n"
                 f"  Foldere posturi găsite: {len(folder_map)}\n"
                 f"{'─'*55}"))
 
-            fisiere = [f for f in os.listdir(sursa) if f.lower().endswith(".bin")]
+            # Căutare recursivă în sursă și în toate subfolderele ei
+            fisiere = []
+            for radacina, subdirs, files in os.walk(sursa):
+                subdirs.sort()
+                for f in sorted(files):
+                    if f.lower().endswith(".bin"):
+                        fisiere.append(os.path.join(radacina, f))
+
             if not fisiere:
                 win.after(0, lambda: _log_win("  ⚠️  Nu există fișiere .bin în folderul sursă."))
                 win.after(0, lambda: btn_start.configure(state="normal"))
@@ -622,40 +659,50 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
 
             win.after(0, lambda: _log_win(f"  Fișiere .bin găsite: {len(fisiere)}\n"))
 
-            mutate = 0; suprascrise = 0; negasite = 0; erori = 0
+            mutate = 0; suprascrise = 0; fara_folder = 0; deja_ok = 0; erori = 0
 
-            for fisier in sorted(fisiere):
-                cale_sursa = os.path.join(sursa, fisier)
+            for cale_sursa in fisiere:
+                fisier = os.path.basename(cale_sursa)
+                afisat = os.path.relpath(cale_sursa, sursa)
                 site_id = _extrage_site_id(cale_sursa)
 
-                if site_id is None:
-                    msg = f"  ⚠️  {fisier}  →  cod neidentificat, omis"
-                    win.after(0, lambda m=msg: _log_win(m))
-                    negasite += 1
-                    continue
+                if site_id is not None and site_id in folder_map:
+                    folder_dest = folder_map[site_id]
+                    in_fara = False
+                    motiv = ""
+                else:
+                    folder_dest = os.path.join(dest, FOLDER_FARA)
+                    in_fara = True
+                    motiv = ("cod neidentificat" if site_id is None
+                             else f"cod {site_id} fără folder")
 
-                if site_id not in folder_map:
-                    msg = f"  ❓  {fisier}  →  cod {site_id} fără folder corespondent"
-                    win.after(0, lambda m=msg: _log_win(m))
-                    negasite += 1
+                # fișierul este deja unde trebuie (ex. sursa include folderele posturi)
+                if _same_dir(os.path.dirname(cale_sursa), folder_dest):
+                    deja_ok += 1
                     continue
-
-                folder_dest = folder_map[site_id]
-                cale_dest   = os.path.join(folder_dest, fisier)
-                exista_deja = os.path.exists(cale_dest)
 
                 try:
+                    os.makedirs(folder_dest, exist_ok=True)
+                    cale_dest = os.path.join(folder_dest, fisier)
+                    exista_deja = os.path.exists(cale_dest)
+
                     shutil.move(cale_sursa, cale_dest)
-                    if exista_deja:
-                        msg = f"  🔄  {fisier}  →  {os.path.basename(folder_dest)}  (suprascriere)"
+                    nume_dest = os.path.basename(folder_dest)
+                    sufix_sup = "  (suprascriere)" if exista_deja else ""
+
+                    if in_fara:
+                        msg = f"  📂  {afisat}  →  {nume_dest}  ({motiv}){sufix_sup}"
+                        fara_folder += 1
+                    elif exista_deja:
+                        msg = f"  🔄  {afisat}  →  {nume_dest}  (suprascriere)"
                         suprascrise += 1
                     else:
-                        msg = f"  ✅  {fisier}  →  {os.path.basename(folder_dest)}"
+                        msg = f"  ✅  {afisat}  →  {nume_dest}"
                         mutate += 1
                     win.after(0, lambda m=msg: _log_win(m))
                     self.after(0, lambda m=msg: self._log(m))
                 except Exception as e:
-                    msg = f"  ❌  {fisier}  →  eroare: {e}"
+                    msg = f"  ❌  {afisat}  →  eroare: {e}"
                     win.after(0, lambda m=msg: _log_win(m))
                     erori += 1
 
@@ -663,7 +710,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 f"\n{'─'*55}\n"
                 f"  ✅  Mutate cu succes:   {mutate}\n"
                 f"  🔄  Suprascrise:        {suprascrise}\n"
-                f"  ❓  Fără folder:        {negasite}\n"
+                f"  📂  În '{FOLDER_FARA}':  {fara_folder}\n"
+                f"  ⏭️  Deja la locul lor:  {deja_ok}\n"
                 f"  ❌  Erori:              {erori}\n"
                 f"{'─'*55}"
             )
@@ -671,7 +719,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self.after(0, lambda: self._log(
                 f"  📦  Sortare .bin finalizată — "
                 f"mutate: {mutate}, suprascrise: {suprascrise}, "
-                f"fără folder: {negasite}, erori: {erori}"))
+                f"fără folder: {fara_folder}, deja ok: {deja_ok}, erori: {erori}"))
             win.after(0, lambda: btn_start.configure(state="normal"))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -1378,7 +1426,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 _now = time.perf_counter()
                 _perf_phases.append(("Procesare + SQLite + Excel .bin", _now - _t_phase))
                 _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
-                                      get_ddp_perf_seconds()))
+                                      get_ddp_perf_seconds(),
+                                      _perf_workers(len(rezultate_bin))))
                 _perf_phases.append(("  └─ din care: SQLite (citire + scriere)",
                                       get_db_perf_seconds()))
                 for _lbl, _secs in get_db_perf_breakdown():
@@ -1472,7 +1521,8 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                 _now = time.perf_counter()
                 _perf_phases.append(("Procesare + SQLite + Excel .log", _now - _t_phase))
                 _perf_phases.append(("  └─ din care: foaia Date detaliate prelucrate",
-                                      get_ddp_perf_seconds()))
+                                      get_ddp_perf_seconds(),
+                                      _perf_workers(len(rezultate_log))))
                 _perf_phases.append(("  └─ din care: SQLite (citire + scriere)",
                                       get_db_perf_seconds()))
                 for _lbl, _secs in get_db_perf_breakdown():
@@ -1529,7 +1579,7 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
             self._log(f"  ⏱ RAPORT DE PERFORMANȚĂ (unde s-a dus timpul):")
             self._log(_format_perf_summary(_perf_phases, _t_run_elapsed))
 
-            _perf_dict = dict(_perf_phases)
+            _perf_dict = {_ph[0]: _ph[1] for _ph in _perf_phases}
             _avg_lines = []
             if _n_bin_ok:
                 _t_proc_bin = _perf_dict.get("Procesare + SQLite + Excel .bin", 0.0)
@@ -1555,6 +1605,39 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                              f"({sum(r['randuri'] for r in rezultate_log):,} ore)")
             lines.append(f"\nRaport{'e' if n_total!=1 else ''} salvat{'e' if n_total!=1 else ''} in:\n{rapoarte_dir}")
             sync_and_release()
+            # Reconstruiește cache-ul hărții (după ce DB-ul e sincronizat)
+            try:
+                import time as _time
+                from harta_api import reconstruieste_cache
+                _t0  = _time.time()
+                _fin = threading.Event()
+
+                def _mmss():
+                    s_ = int(_time.time() - _t0)
+                    return f"{s_ // 60:02d}:{s_ % 60:02d}"
+
+                def _beat():
+                    n = 0
+                    while not _fin.wait(1):
+                        n += 1
+                        t_ = _mmss()
+                        self.after(0, lambda t=t_: self.lbl_status.configure(
+                            text=f"🗺️  Actualizez cache-ul hărții...  ⏱ {t}"))
+                        if n % 15 == 0:
+                            self._log(f"   ⏱ cache hartă: {t_} scurse...")
+
+                threading.Thread(target=_beat, daemon=True).start()
+                self._log("🗺️  Actualizez cache-ul hărții...")
+                try:
+                    _procesate = [r["id"] for r in (list(rezultate_bin) + list(rezultate_log))]
+                    reconstruieste_cache(log=self._log, contoare=_procesate or None)
+                finally:
+                    _fin.set()
+                self._log(f"🗺️  Harta este gata — cache actualizat în {_mmss()}.")
+                self.after(0, lambda: self.lbl_status.configure(
+                    text="🗺️  Cache hartă actualizat."))
+            except Exception as _e:
+                self._log(f"⚠ Cache hartă neactualizat: {_e}")
             self.after(0, lambda: messagebox.showinfo("Succes", "\n".join(lines)))
 
         except Exception as ex:
@@ -2393,6 +2476,11 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                 _on_close()
                         except Exception:
                             pass
+                    try:
+                        from harta_api import reconstruieste_cache_async
+                        reconstruieste_cache_async(contoare=[ct])
+                    except Exception:
+                        pass
                     win.after(0, _ok)
                 except Exception as e:
                     def _err(err=str(e)):

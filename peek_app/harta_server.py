@@ -31,7 +31,7 @@ import logging
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from harta_api import _build_response
+from harta_api import _build_response, reconstruieste_cache_async
 
 # ── Supress Flask/Werkzeug console spam ──────────────────────────────────────
 log = logging.getLogger("werkzeug")
@@ -67,7 +67,8 @@ class HartaServer:
         @flask_app.route("/api/harta_contoare", methods=["GET"])
         def api_contoare():
             try:
-                return jsonify(_build_response())
+                return jsonify(_build_response(
+                    force_refresh=request.args.get("refresh") == "1"))
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 

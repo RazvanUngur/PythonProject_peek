@@ -11,7 +11,7 @@ import pandas as pd
 
 from config import LOG_CLASS_MAP, BAND_COLORS, MIN_ORE_ZI, CENTRAL_FILE_FOLDER, RAPOARTE_PEEK_FOLDER
 from excel_report import (
-    add_charts_and_formatting, precompute_localitati,
+    add_charts_and_formatting, precompute_localitati, precompute_contor_info,
     read_mzl_manual_fallback_from_centralizator,
 )
 from database import get_traffic_db
@@ -305,6 +305,7 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
             print(f"  [WARN] SQLite indisponibil: {_e_tdb}")
 
         localitati = precompute_localitati(list(contoare_files.keys()))
+        contor_infos = precompute_contor_info(list(contoare_files.keys()))
         # Orele scrise ACUM în SQLite per contor; se transmit callback-ului de
         # progres ca al 5-lea argument DOAR dacă acesta îl acceptă.
         _scrise_now = {}
@@ -475,6 +476,7 @@ def process_log_files(filepaths, output_dir=None, stop_event=None,
                 "mzl_manual": _mzl_manual,
                 "live_sources": _live_src,
                 "localitate_site": localitati.get(str(site_id)),
+                "contor_info": contor_infos.get(str(site_id)),
             }
             rezultat = {
                 "path":       output_fn,

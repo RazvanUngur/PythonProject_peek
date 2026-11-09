@@ -22,7 +22,7 @@ from config import (
     MIN_ORE_ZI, BAND_COLORS,
 )
 from excel_report import (
-    add_charts_and_formatting, precompute_localitati,
+    add_charts_and_formatting, precompute_localitati, precompute_contor_info,
     read_mzl_manual_fallback_from_centralizator,
 )
 from database import get_traffic_db
@@ -1511,6 +1511,7 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
                 pass
         hb.set("Faza 2: calculez localitățile contoarelor")
         localitati = precompute_localitati(list(contoare_data.keys()))
+        contor_infos = precompute_contor_info(list(contoare_data.keys()))
         # Orele scrise ACUM în SQLite per contor (din fișierele procesate la
         # această rulare). Se transmit callback-ului de progres ca al 5-lea
         # argument, DOAR dacă acesta îl acceptă (apelanții vechi, cu 4
@@ -1719,6 +1720,7 @@ def process_multiple_files(filepaths, output_dir=None, stop_event=None,
                 "mzl_manual": _mzl_manual,
                 "live_sources": _live_src,
                 "localitate_site": localitati.get(str(site_id)),
+                "contor_info": contor_infos.get(str(site_id)),
             }
             rezultat = {
                 'path': output_fn, 'id': site_id, 'randuri': n_randuri,

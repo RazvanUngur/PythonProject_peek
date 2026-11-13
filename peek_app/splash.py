@@ -124,7 +124,7 @@ class SplashScreen:
 
         # Versiune
         self.cv.create_text(W//2, H - 22,
-                            text="v7.20",
+                            text="v7.50",
                             font=("Segoe UI", 8),
                             fill=self.c["fg_sub"],
                             anchor="center")

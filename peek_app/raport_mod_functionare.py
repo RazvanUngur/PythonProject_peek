@@ -33,16 +33,18 @@ from openpyxl.utils import get_column_letter
 from config import CENTRAL_FILE_FOLDER
 import sqlite3
 from database import get_traffic_db, get_contoare_db, CONTOARE_DB
+from verificare_posturi import citeste_verificari, ETICHETE_STATUS
 
 PRAG_TOT = 0.3           # prag valabil DOAR pentru acest raport (Clasa_15 / Total)
 MAX_BENZI = 6
+FOLDER_RAPOARTE = "Rapoarte"   # subfolder in CENTRAL_FILE_FOLDER unde se salveaza raportul
 OMITE_REDENUMITE = True   # True = nu apar posturile cu cod vechi (redenumite) din contor_alias
 
 HEADERS = [
     "DRDP", "Drum", "Pozitie km.", "Post", "Localitatea", "IP",
     "Mod de functionare", "Piese/materiale necesare/recomandari", "Probleme",
 ]
-COL_WIDTHS = [14, 10, 14, 10, 24, 16, 38, 44, 12]
+COL_WIDTHS = [14, 10, 14, 10, 24, 16, 38, 71, 12]   # col. H (Piese/recomandari) 71 ≈ 500 px
 
 
 # ── Logică stare bandă ───────────────────────────────────────────────────────
@@ -88,6 +90,41 @@ def _coduri_redenumite():
             conn.close()
     except Exception:
         return set()      # tabelul nu exista inca -> nimic redenumit
+
+
+# ── Motivul lipsei datelor (din verificarea zilnica a posturilor) ─────────────
+
+_RECOMANDARE_STATUS = {
+    "RETEA_CAZUTA": "Verificare router / SIM  / Wiznet",
+    "CONTOR_CAZUT": "Verificare baterie / alimentare contor",
+    "OK":           "Verificati descarcarea / prelucrarea datelor din aceasta zi",
+    "EROARE":       "Eroare la verificare - reluati verificarea",
+}
+
+
+def _motiv_fara_date(ver, info):
+    """Linia 'Motiv: ...' pentru un contor fara date, pe baza verificarii din ziua raportului.
+    `ver` = {'status','detaliu','incercari','verificat_la'} sau None; `info` = randul din contoare.db."""
+    if ver is None:
+        ip = str(info.get("IP", "") or "").strip()
+        tip = str(info.get("Tip", "") or "").strip()
+        if not ip:
+            return "Motiv: neverificabil (fara IP in baza de date)"
+        if tip.lower() not in {"adr 3000", "adr 2000", "adr sabre"}:
+            return f"Motiv: neverificabil (tip {tip or 'necunoscut'})"
+        return "Motiv: verificarea zilnica nu a fost efectuata in aceasta zi"
+    if ver["status"] == "OK":
+        txt = "Motiv: contorul raspunde la verificare, dar nu are date inregistrate"
+    else:
+        txt = f"Motiv: {ETICHETE_STATUS.get(ver['status'], ver['status'])}"
+    if ver["detaliu"]:
+        txt += f" - {ver['detaliu']}"
+    nr = ver.get("incercari") or 1
+    txt += f"\nVerificat {ver['verificat_la']} (incercari: {nr})"
+    rec = _RECOMANDARE_STATUS.get(ver["status"])
+    if rec:
+        txt += f"\nRecomandare: {rec}"
+    return txt
 
 
 # ── Benzi pereche (doar contoare cu 2 sau 4 benzi) ───────────────────────────
@@ -164,6 +201,10 @@ def _construieste_randuri(data):
     fara_date = [str(c) for c in contoare
                  if str(c) not in zi and str(c).strip() not in redenumite]
     ultima_zi = _ultima_zi_cu_date(fara_date, data)
+    try:
+        verificari = citeste_verificari(data)
+    except Exception:
+        verificari = {}       # tabel/DB inaccesibil -> raportul se genereaza oricum
 
     randuri = []
     for ct_id, info in contoare.items():
@@ -172,8 +213,9 @@ def _construieste_randuri(data):
         d = zi.get(str(ct_id))
         if d is None:
             uz = ultima_zi.get(str(ct_id))
-            piese = (f"Ultima zi cu date inregistrate: {uz.strftime('%d.%m.%Y')}"
-                     if uz else "Nu exista date inregistrate anterior")
+            piese_uz = (f"Ultima zi cu date inregistrate: {uz.strftime('%d.%m.%Y')}"
+                        if uz else "Nu exista date inregistrate anterior")
+            piese = _motiv_fara_date(verificari.get(str(ct_id)), info) + "\n" + piese_uz
             mod, probleme = "Fara date inregistrate in aceasta zi", "Fara date"
         else:
             mod_l, piese_l, are_problema = [], [], False
@@ -284,9 +326,10 @@ def genereaza_raport(data, cale_iesire=None):
     """Generează raportul pentru `data` (datetime.date) și returnează calea fișierului."""
     randuri = _construieste_randuri(data)
     if cale_iesire is None:
-        os.makedirs(CENTRAL_FILE_FOLDER, exist_ok=True)
+        folder = os.path.join(CENTRAL_FILE_FOLDER, FOLDER_RAPOARTE)
+        os.makedirs(folder, exist_ok=True)
         cale_iesire = os.path.join(
-            CENTRAL_FILE_FOLDER, f"Raport_Mod_Functionare_{data.strftime('%Y-%m-%d')}.xlsx")
+            folder, f"Raport_Mod_Functionare_{data.strftime('%Y-%m-%d')}.xlsx")
     _scrie_excel(randuri, data, cale_iesire)
     return cale_iesire
 
@@ -301,14 +344,24 @@ def _parse_data(s):
     raise ValueError(f"Data invalida: '{s}' (format asteptat: ZZ.LL.AAAA)")
 
 
-def _cere_data_gui():
-    """Fereastra mică în care alegi data (ZZ.LL.AAAA). Returnează date sau None."""
+def _radacina_tk():
+    """Returneaza (root, creat_aici). Daca exista deja o aplicatie Tk (ex. PeekApp),
+    o foloseste pe aceea si NU creeaza un al doilea tk.Tk()."""
     import tkinter as tk
-    from tkinter import simpledialog, messagebox
-
+    root = getattr(tk, "_default_root", None)
+    if root is not None:
+        return root, False
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
+    return root, True
+
+
+def _cere_data_gui():
+    """DOAR pentru rularea ca script (PyCharm). Din aplicatie se foloseste dialogul
+    PeekApp._open_raport_dialog. Returneaza date sau None."""
+    from tkinter import simpledialog, messagebox
+    root, creat = _radacina_tk()
     implicit = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%d.%m.%Y")
     try:
         while True:
@@ -323,18 +376,19 @@ def _cere_data_gui():
             except ValueError as e:
                 messagebox.showerror("Data invalida", str(e), parent=root)
     finally:
-        root.destroy()
+        if creat:
+            root.destroy()
 
 
 def _anunta_gui(cale):
-    import tkinter as tk
     from tkinter import messagebox
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    deschide = messagebox.askyesno(
-        "Raport generat", f"Raport salvat:\n{cale}\n\nIl deschid acum?", parent=root)
-    root.destroy()
+    root, creat = _radacina_tk()
+    try:
+        deschide = messagebox.askyesno(
+            "Raport generat", f"Raport salvat:\n{cale}\n\nIl deschid acum?", parent=root)
+    finally:
+        if creat:
+            root.destroy()
     if deschide:
         try:
             os.startfile(cale)         # Windows

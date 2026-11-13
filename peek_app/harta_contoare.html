@@ -134,6 +134,15 @@
                     display:inline-flex; align-items:center; gap:6px; }
     .popup-status-dot { width:8px; height:8px; border-radius:50%; }
     .popup-status-lbl { font-size:11.5px; font-weight:600; }
+    .popup-benzi-title { margin-top:9px; font-size:10px; font-weight:700;
+                         color:#64748b; letter-spacing:.4px; }
+    .benzi-row  { display:flex; align-items:center; flex-wrap:wrap; gap:5px;
+                  padding:3px 0; font-size:12px; }
+    .benzi-id   { font-weight:700; color:#1e293b; width:22px; }
+    .benzi-chip { font-size:11px; font-weight:600; padding:1px 8px;
+                  border-radius:8px; border:1px solid; }
+    .benzi-meta { color:#64748b; font-size:11px; }
+    .benzi-tag  { font-size:10px; font-weight:600; padding:1px 6px; border-radius:8px; }
     .popup-noloc-hint { margin-top:6px; font-size:11px; color:#7c3aed; }
 
     .drag-confirm { font-family:'Segoe UI',system-ui,sans-serif; padding:4px; }
@@ -190,7 +199,9 @@
       <div class="leg-title">LEGENDĂ</div>
       <div id="leg-rows"></div>
       <div id="leg-note">
-        Clasa 15 ≥ 10% → Totalizator<br/>
+        Bandă totalizator: clasa 15 ≥ 10% sau clasa 2 &lt; clasa 4<br/>
+        Parțial totalizator: benzi totalizator + clasificator, sau o bandă cu clasa 2 &lt; clasa 4<br/>
+        Parțial defect: ≥ 1 bandă fără trafic, restul active<br/>
         Contoare fără coordonate: trage markerul ⊕ pe poziție
       </div>
     </div>
@@ -210,11 +221,13 @@
 // CONFIG STATUS
 // ═══════════════════════════════════════════════════════════════════════════
 const STATUS_CFG = {
-  CLASIFICATOR: { label:"Clasificator",    fill:"#22c55e", ring:"#15803d", color:"#14532d" },
-  TOTALIZATOR:  { label:"Totalizator",     fill:"#f59e0b", ring:"#d97706", color:"#78350f" },
-  FARA_COM:     { label:"Fără comunicare", fill:"#a78bfa", ring:"#6d28d9", color:"#4c1d95" },
-  DEFECT:       { label:"Defect",          fill:"#ef4444", ring:"#dc2626", color:"#7f1d1d" },
-  NELOCALIZAT:  { label:"Nelocalizat",     fill:"#9ca3af", ring:"#6b7280", color:"#374151" },
+  CLASIFICATOR:        { label:"Clasificator",        fill:"#22c55e", ring:"#15803d", color:"#14532d" },
+  PARTIAL_TOTALIZATOR: { label:"Parțial totalizator", fill:"#facc15", ring:"#ca8a04", color:"#713f12" },
+  TOTALIZATOR:         { label:"Totalizator",         fill:"#f59e0b", ring:"#d97706", color:"#78350f" },
+  PARTIAL_DEFECT:      { label:"Parțial defect",      fill:"#ec4899", ring:"#be185d", color:"#831843" },
+  DEFECT:              { label:"Defect",              fill:"#ef4444", ring:"#dc2626", color:"#7f1d1d" },
+  FARA_COM:            { label:"Fără comunicare",     fill:"#a78bfa", ring:"#6d28d9", color:"#4c1d95" },
+  NELOCALIZAT:         { label:"Nelocalizat",         fill:"#9ca3af", ring:"#6b7280", color:"#374151" },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -276,6 +289,32 @@ function fmt(v) {
   return v == null ? "—" : Number(v).toLocaleString("ro-RO");
 }
 
+// ── Funcționarea pe benzi (ca în raport_mod_functionare) ───────────────────
+const BANDA_CFG = {
+  C: { txt:"Clasificator",     fill:"#22c55e", bg:"#dcfce7", color:"#14532d" },
+  T: { txt:"Totalizator",      fill:"#f59e0b", bg:"#fef3c7", color:"#78350f" },
+  D: { txt:"Nu înregistrează", fill:"#ef4444", bg:"#fee2e2", color:"#7f1d1d" },
+};
+
+function buildBenziHtml(c) {
+  if (!Array.isArray(c.benzi) || !c.benzi.length) return "";
+  const rows = c.benzi.map(b => {
+    const k = BANDA_CFG[b.stare] || BANDA_CFG.C;
+    const meta = b.stare === "D" ? "0 veh" : `${fmt(b.total)} veh · cls.15 ${b.pct15}%`;
+    const tags = [];
+    if (b.cls2_lt_cls4) tags.push(["cls.2 < cls.4", "#fef3c7", "#92400e"]);
+    if (b.incomplet)    tags.push(["trafic incomplet", "#ede9fe", "#5b21b6"]);
+    const tagsHtml = tags.map(([t, bg, col]) =>
+      `<span class="benzi-tag" style="background:${bg};color:${col}">${t}</span>`).join("");
+    return `<div class="benzi-row">
+      <span class="benzi-id">B${b.b}</span>
+      <span class="benzi-chip" style="background:${k.bg};color:${k.color};border-color:${k.fill}">${k.txt}</span>
+      <span class="benzi-meta">${meta}</span>${tagsHtml}
+    </div>`;
+  }).join("");
+  return `<div class="popup-benzi-title">FUNCȚIONARE PE BENZI · ${c.luna_ref||""}</div>${rows}`;
+}
+
 function buildPopup(c) {
   const s = STATUS_CFG[c.status] || STATUS_CFG.NELOCALIZAT;
   const mzlStr = c.mzl != null ? fmt(c.mzl)+" veh/zi" : "Indisponibil";
@@ -289,7 +328,9 @@ function buildPopup(c) {
   const pct15 = (c.total_cls15!=null && c.total_veh)
     ? `${fmt(c.total_cls15)} (${Math.round(c.total_cls15/c.total_veh*100)}%)`
     : "—";
-  const ultimaRow = (c.ultima_luna && c.status!=="CLASIFICATOR" && c.status!=="TOTALIZATOR")
+  const areDateRef = ["CLASIFICATOR","TOTALIZATOR","PARTIAL_TOTALIZATOR","PARTIAL_DEFECT"]
+    .includes(c.status);
+  const ultimaRow = (c.ultima_luna && !areDateRef)
     ? `<tr><td>Ultimele date</td><td style="color:#475569">${c.ultima_luna}</td></tr>` : "";
   const nolocHint = c.status==="NELOCALIZAT"
     ? `<div class="popup-noloc-hint">📍 Trage markerul pe poziția corectă pentru a salva coordonatele.</div>`
@@ -315,6 +356,7 @@ function buildPopup(c) {
         <tr><td>Acoperire ore</td><td style="color:#475569">${c.acop_pct!=null?c.acop_pct+"%":"—"}</td></tr>
         ${ultimaRow}
       </table>
+      ${buildBenziHtml(c)}
       <div class="popup-status"
            style="background:${s.fill}18;border:1px solid ${s.ring}">
         <span class="popup-status-dot" style="background:${s.fill}"></span>

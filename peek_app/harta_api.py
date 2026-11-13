@@ -33,6 +33,17 @@ CACHE_FILE  = os.path.join(os.path.dirname(os.path.abspath(TRAFFIC_DB)),
                            "harta_cache.json")
 _cache_lock = threading.Lock()
 
+# Versiunea formatului cache-ului. Crește când se schimbă structura din "stats"
+# (2 = adaugă detaliul pe benzi). Un cache cu altă versiune e ignorat și se
+# reconstruiește singur la prima deschidere a hărții.
+CACHE_VERSIUNE = 2
+
+# ── Benzi ─────────────────────────────────────────────────────────────────────
+PRAG_TOT_BANDA = 0.10     # bandă totalizator dacă clasa 15 / total bandă >= prag
+MAX_BENZI      = 6
+PERECHI        = {2: [(1, 2)], 4: [(1, 4), (2, 3)]}   # ca în raport_mod_functionare
+RAPORT_PERECHE = 2        # banda mai mică are de >= 2 ori mai puțin trafic decât perechea
+
 
 # ── Luna de referință ─────────────────────────────────────────────────────────
 def _luna_referinta() -> tuple:
@@ -52,6 +63,17 @@ def _luna_referinta() -> tuple:
 
 
 # ── Interogări (folosesc indexurile existente din database.py) ───────────────
+def _cols_benzi() -> str:
+    """Sume lunare pe fiecare bandă: total, clasa 15, clasa 2, clasa 4."""
+    parts = ["MAX(n_benzi) AS n_benzi"]
+    for b in range(1, MAX_BENZI + 1):
+        parts.append(f"COALESCE(SUM(total_b{b}), 0)     AS t{b}")
+        parts.append(f"COALESCE(SUM(b{b}_clasa_15), 0)  AS c{b}")
+        parts.append(f"COALESCE(SUM(b{b}_clasa_2), 0)   AS k2_{b}")
+        parts.append(f"COALESCE(SUM(b{b}_clasa_4), 0)   AS k4_{b}")
+    return ",\n        ".join(parts)
+
+
 _SQL_REF = """
     SELECT
         contor,
@@ -59,7 +81,8 @@ _SQL_REF = """
         SUM(b1_clasa_15 + b2_clasa_15 + b3_clasa_15 +
             b4_clasa_15 + b5_clasa_15 + b6_clasa_15) AS total_cls15,
         COUNT(*)                                     AS ore_inreg,
-        COUNT(DISTINCT zi)                           AS zile_cu_date
+        COUNT(DISTINCT zi)                           AS zile_cu_date,
+        """ + _cols_benzi() + """
     FROM inregistrari_orare
     WHERE an = ? AND luna = ? {extra}
     GROUP BY contor
@@ -75,6 +98,83 @@ _SQL_ULTIMA = """
 """
 
 
+# ── Starea pe benzi ───────────────────────────────────────────────────────────
+def _analiza_benzi(row, total_general: int) -> list:
+    """
+    Starea fiecărei benzi pe luna de referință (sume lunare):
+      D — total bandă == 0                       (nu înregistrează)
+      T — clasa 15 / total >= PRAG_TOT_BANDA     (senzor piezoelectric)
+          SAU clasa 2 < clasa 4                  (buclă inductivă de ieșire)
+      C — altfel                                 (clasificator)
+    `incomplet` = banda mai mică dintr-o pereche (2 sau 4 benzi) cu trafic > 0,
+    când perechea ei are >= RAPORT_PERECHE x mai mult. Doar informativ.
+    Returnează [] dacă nu există detaliu pe benzi în baza de date.
+    """
+    try:
+        n = int(row["n_benzi"] or 2)
+        n = n if n in (2, 4, 6) else max(2, min(n, MAX_BENZI))
+        tot = {b: int(row[f"t{b}"] or 0)    for b in range(1, n + 1)}
+        c15 = {b: int(row[f"c{b}"] or 0)    for b in range(1, n + 1)}
+        c2  = {b: int(row[f"k2_{b}"] or 0)  for b in range(1, n + 1)}
+        c4  = {b: int(row[f"k4_{b}"] or 0)  for b in range(1, n + 1)}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return []
+
+    # Total general > 0 dar nicio bandă cu trafic => înregistrări vechi fără
+    # detaliu pe benzi; nu le tratăm ca defecte.
+    if total_general > 0 and not any(tot.values()):
+        return []
+
+    incomplete = set()
+    for a, b in PERECHI.get(n, []):
+        mic, mare = (a, b) if tot[a] < tot[b] else (b, a)
+        if tot[mic] > 0 and tot[mare] >= RAPORT_PERECHE * tot[mic]:
+            incomplete.add(mic)
+
+    benzi = []
+    for b in range(1, n + 1):
+        t = tot[b]
+        if t == 0:
+            stare, piezo, k = "D", False, False
+        else:
+            piezo = c15[b] / t >= PRAG_TOT_BANDA
+            k     = c2[b] < c4[b]
+            stare = "T" if (piezo or k) else "C"
+        benzi.append({
+            "b":            b,
+            "stare":        stare,
+            "total":        t,
+            "pct15":        round(c15[b] / t * 100, 1) if t else 0.0,
+            "piezo":        piezo,
+            "cls2_lt_cls4": k,
+            "incomplet":    b in incomplete,
+        })
+    return benzi
+
+
+def _status_din_benzi(benzi: list) -> str:
+    """
+    Statusul contorului din starea benzilor (în ordinea priorității):
+      DEFECT              — nicio bandă nu înregistrează
+      PARTIAL_DEFECT      — cel puțin o bandă nu înregistrează, dar există
+                            minim o bandă clasificator/totalizator
+      PARTIAL_TOTALIZATOR — cel puțin o bandă totalizator și minim o bandă
+                            clasificator, SAU cel puțin o bandă cu clasa 2 < clasa 4
+      TOTALIZATOR         — toate benzile active sunt totalizator
+      CLASIFICATOR        — toate benzile active sunt clasificator
+    """
+    active = [x for x in benzi if x["stare"] != "D"]
+    if not active:
+        return "DEFECT"
+    if len(active) < len(benzi):
+        return "PARTIAL_DEFECT"
+    n_tot = sum(1 for x in active if x["stare"] == "T")
+    n_cls = len(active) - n_tot
+    if any(x["cls2_lt_cls4"] for x in active) or (n_tot and n_cls):
+        return "PARTIAL_TOTALIZATOR"
+    return "TOTALIZATOR" if n_tot else "CLASIFICATOR"
+
+
 # ── Logica de status (comună pentru calcul individual și în masă) ────────────
 def _compune_stats(an_ref, luna_ref, row_ref, tmzl_row, mzl_row, row_ultima):
     """
@@ -83,9 +183,10 @@ def _compune_stats(an_ref, luna_ref, row_ref, tmzl_row, mzl_row, row_ultima):
       2. mzl_manual
       3. calcul direct din inregistrari_orare
 
-    Status:
-      CLASIFICATOR  — are date luna ref, clasa_15 < 10% din total
-      TOTALIZATOR   — are date luna ref, clasa_15 ≥ 10% din total
+    Status (cu date pe luna ref, calculat din starea benzilor — vezi
+    _status_din_benzi): CLASIFICATOR, TOTALIZATOR, PARTIAL_TOTALIZATOR,
+    PARTIAL_DEFECT, DEFECT. Dacă nu există detaliu pe benzi, se folosește
+    vechea regulă pe total: clasa_15 ≥ 10% → TOTALIZATOR, altfel CLASIFICATOR.
       FARA_COM      — nu are date luna ref, dar ultima lună înregistrată are total > 0
       DEFECT        — luna ref: total = 0, SAU nu are date luna ref și ultima lună total = 0
     """
@@ -111,11 +212,15 @@ def _compune_stats(an_ref, luna_ref, row_ref, tmzl_row, mzl_row, row_ultima):
     ultima_luna_str = (f"{row_ultima['luna']:02d}.{row_ultima['an']}"
                        if row_ultima else None)
 
+    benzi = []
     if are_date_ref:
         total_veh   = int(row_ref["total_veh"]   or 0)
         total_cls15 = int(row_ref["total_cls15"] or 0)
+        benzi = _analiza_benzi(row_ref, total_veh)
         if total_veh == 0:
             status = "DEFECT"
+        elif benzi:
+            status = _status_din_benzi(benzi)
         elif total_cls15 / total_veh >= 0.10:
             status = "TOTALIZATOR"
         else:
@@ -138,6 +243,7 @@ def _compune_stats(an_ref, luna_ref, row_ref, tmzl_row, mzl_row, row_ultima):
         "ultima_luna":  ultima_luna_str,
         "total_cls15":  int(row_ref["total_cls15"] or 0) if are_date_ref else None,
         "total_veh":    int(row_ref["total_veh"]   or 0) if are_date_ref else None,
+        "benzi":        benzi,
     }
 
 
@@ -280,7 +386,8 @@ def _citeste_cache(an_ref: int, luna_ref: int):
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("luna_ref") == f"{luna_ref:02d}.{an_ref}":
+        if (data.get("versiune") == CACHE_VERSIUNE
+                and data.get("luna_ref") == f"{luna_ref:02d}.{an_ref}"):
             if data.get("stats"):
                 return data
     except Exception:
@@ -290,6 +397,7 @@ def _citeste_cache(an_ref: int, luna_ref: int):
 
 def _scrie_cache(an_ref: int, luna_ref: int, stats: dict, disponibile=None):
     data = {
+        "versiune":   CACHE_VERSIUNE,
         "disponibile": sorted(disponibile) if disponibile is not None else None,
         "luna_ref":   f"{luna_ref:02d}.{an_ref}",
         "generat_la": datetime.now().isoformat(timespec="seconds"),

@@ -397,6 +397,10 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
                                   self._open_harta, "navy", width=190)
         self.btn_harta.pack(side="left", padx=6)
 
+        self.btn_raport = _ctk_btn(row_actions2, "📊  Raport",
+                                   self._open_raport_dialog, "info", width=140)
+        self.btn_raport.pack(side="left", padx=6)
+
         # ── Progress bar ──────────────────────────────────────────────────────
         if CTK_AVAILABLE:
             self.progress = ctk.CTkProgressBar(self, width=560, height=14,
@@ -449,6 +453,208 @@ class PeekApp(ctk.CTk if CTK_AVAILABLE else tk.Tk):
     def _open_harta(self):
         """Deschide harta contoare în browser-ul default."""
         self._harta_server.open_in_browser()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Raport „Mod de funcționare” contoare active
+    # ══════════════════════════════════════════════════════════════════════════
+    def _open_raport_dialog(self):
+        """
+        Fereastră (Toplevel al aplicației — NU un al doilea tk.Tk) în care alegi
+        data și generezi raportul din raport_mod_functionare.py.
+        Generarea rulează într-un thread, deci fereastra principală nu îngheață.
+        """
+        try:
+            import raport_mod_functionare as rmf
+        except Exception as e:
+            messagebox.showerror(
+                "Modul lipsă",
+                f"Nu pot încărca raport_mod_functionare.py:\n{e}", parent=self)
+            return
+
+        # Singleton: dacă fereastra e deja deschisă, o aducem în față
+        if getattr(self, "_raport_win", None) is not None:
+            try:
+                if self._raport_win.winfo_exists():
+                    self._raport_win.lift()
+                    self._raport_win.focus_force()
+                    return
+            except Exception:
+                pass
+            self._raport_win = None
+
+        import datetime as _dt
+
+        win = ctk.CTkToplevel(self) if CTK_AVAILABLE else tk.Toplevel(self)
+        self._raport_win = win
+        win.title("Raport mod funcționare contoare")
+        win.resizable(False, False)
+        W, H = 500, 330
+        sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+        win.geometry(f"{W}x{H}+{(sw - W) // 2}+{(sh - H) // 2}")
+        win.transient(self)
+
+        def _on_close():
+            self._raport_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        def _bring_to_front():
+            try:
+                if win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+            except Exception:
+                pass
+        win.after(150, _bring_to_front)
+
+        _add_logo_header(win, "Raport mod funcționare", app_ref=self)
+
+        var_data = tk.StringVar(
+            value=(_dt.date.today() - _dt.timedelta(days=1)).strftime("%d.%m.%Y"))
+        stare = {"ruleaza": False, "cale": None}
+
+        # ── Alegere dată ──────────────────────────────────────────────────────
+        if CTK_AVAILABLE:
+            row_data = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            row_data = tk.Frame(win)
+        row_data.pack(fill="x", padx=28, pady=(8, 4))
+
+        _ctk_label(row_data, "Data raportului (ZZ.LL.AAAA):",
+                   font=FONT_SMALL).pack(side="left", padx=(0, 10))
+        ent_data = _ctk_entry(row_data, textvariable=var_data, width=110)
+        ent_data.pack(side="left")
+
+        def _set_zile_in_urma(n):
+            var_data.set((_dt.date.today() - _dt.timedelta(days=n)).strftime("%d.%m.%Y"))
+
+        _ctk_btn(row_data, "Ieri", lambda: _set_zile_in_urma(1),
+                 "navy", width=60).pack(side="left", padx=(10, 4))
+        _ctk_btn(row_data, "Azi", lambda: _set_zile_in_urma(0),
+                 "navy", width=60).pack(side="left", padx=4)
+
+        _ctk_label(win,
+                   "  ℹ️  Pentru contoarele „Fără date” raportul trece motivul din\n"
+                   "      verificarea zilnică a posturilor (Task Scheduler, ora 08:00).",
+                   font=FONT_SMALL, text_color="#555555").pack(
+            anchor="w", padx=28, pady=(2, 6))
+
+        # ── Buton generare + stare ────────────────────────────────────────────
+        btn_gen = _ctk_btn(win, "📊  Generează raport", lambda: on_genereaza(),
+                           "success", width=220)
+        btn_gen.pack(pady=(6, 6))
+
+        if CTK_AVAILABLE:
+            prog = ctk.CTkProgressBar(win, width=420, height=12, corner_radius=6,
+                                      mode="indeterminate",
+                                      progress_color="#1A7A3C")
+            prog.set(0)
+        else:
+            prog = ttk.Progressbar(win, orient="horizontal", length=420,
+                                   mode="indeterminate")
+        prog.pack(pady=(0, 4))
+
+        lbl_stare = _ctk_label(win, "Alege data și apasă „Generează raport”.",
+                               font=FONT_SMALL, text_color="#555555",
+                               wraplength=440, justify="center")
+        lbl_stare.pack(pady=(0, 6))
+
+        if CTK_AVAILABLE:
+            row_open = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            row_open = tk.Frame(win)
+        row_open.pack(pady=(0, 8))
+
+        def _deschide_fisier():
+            if stare["cale"]:
+                try:
+                    os.startfile(stare["cale"])
+                except Exception as e:
+                    messagebox.showerror("Eroare", str(e), parent=win)
+
+        def _deschide_folder():
+            if stare["cale"]:
+                try:
+                    os.startfile(os.path.dirname(stare["cale"]))
+                except Exception as e:
+                    messagebox.showerror("Eroare", str(e), parent=win)
+
+        btn_open = _ctk_btn(row_open, "📂  Deschide raport", _deschide_fisier,
+                            "primary", width=180, state="disabled")
+        btn_open.pack(side="left", padx=6)
+        btn_folder = _ctk_btn(row_open, "📁  Deschide folder", _deschide_folder,
+                              "navy", width=180, state="disabled")
+        btn_folder.pack(side="left", padx=6)
+
+        # ── Helpere de afișare (compatibile CTk / tk) ─────────────────────────
+        def _set_stare(txt, culoare="#555555"):
+            if CTK_AVAILABLE:
+                lbl_stare.configure(text=txt, text_color=culoare)
+            else:
+                lbl_stare.configure(text=txt, fg=culoare)
+
+        def _prog(pornit):
+            if CTK_AVAILABLE:
+                prog.start() if pornit else (prog.stop(), prog.set(0))
+            else:
+                prog.start(12) if pornit else prog.stop()
+
+        # ── Generare în thread ────────────────────────────────────────────────
+        def _gata(zi, cale, err):
+            stare["ruleaza"] = False
+            if err:
+                self._log(f"📊 ✗ Raport {zi.strftime('%d.%m.%Y')} eșuat: {err}")
+            else:
+                self._log(f"📊 Raport {zi.strftime('%d.%m.%Y')} salvat: {cale}")
+            try:
+                if not win.winfo_exists():       # fereastra a fost închisă între timp
+                    return
+            except Exception:
+                return
+            _prog(False)
+            btn_gen.configure(state="normal")
+            if err:
+                _set_stare(f"Eroare: {err}", "#B03A2E")
+                messagebox.showerror("Eroare raport", err, parent=win)
+            else:
+                stare["cale"] = cale
+                _set_stare(f"Raport salvat:\n{cale}", "#1E8449")
+                btn_open.configure(state="normal")
+                btn_folder.configure(state="normal")
+
+        def on_genereaza():
+            if stare["ruleaza"]:
+                return
+            try:
+                zi = rmf._parse_data(var_data.get())
+            except ValueError as e:
+                messagebox.showerror("Dată invalidă", str(e), parent=win)
+                return
+            stare["ruleaza"] = True
+            stare["cale"] = None
+            btn_gen.configure(state="disabled")
+            btn_open.configure(state="disabled")
+            btn_folder.configure(state="disabled")
+            _set_stare(f"Se generează raportul pentru {zi.strftime('%d.%m.%Y')}…")
+            _prog(True)
+            self._log(f"📊 Generez raportul de mod funcționare pentru {zi.strftime('%d.%m.%Y')}…")
+
+            def _run():
+                cale, err = None, None
+                try:
+                    cale = rmf.genereaza_raport(zi)
+                except Exception as e:
+                    err = str(e)
+                # revenire pe thread-ul GUI prin fereastra principală (există mereu)
+                self.after(0, lambda: _gata(zi, cale, err))
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        ent_data.bind("<Return>", lambda e: on_genereaza())
 
     # ══════════════════════════════════════════════════════════════════════════
     # Sortare .bin după post

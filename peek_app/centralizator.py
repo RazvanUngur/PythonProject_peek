@@ -648,6 +648,20 @@ def _write_centralizator_file(df_final, _last_user):
         culori_ani = ["2E75B6", "ED7D31", "70AD47", "FFC000", "5B9BD5"]
         start_row = 3
 
+        # Layout: graficele sunt în stânga (ancorate în A), iar tabelele
+        # încep la dreapta lor, din coloana G (TBL_COL0 = eticheta „Luna”,
+        # urmată de câte o coloană pentru fiecare an). Astfel, oricâți ani
+        # ar fi, tabelul crește spre dreapta fără să se suprapună cu graficul.
+        TBL_COL0 = 7   # G
+        ws_a.column_dimensions["A"].width = 14
+        for _c in ("B", "C", "D"):
+            ws_a.column_dimensions[_c].width = 20
+        ws_a.column_dimensions["E"].width = 12
+        ws_a.column_dimensions["F"].width = 3     # spațiu între grafic și tabel
+        ws_a.column_dimensions[get_column_letter(TBL_COL0)].width = 16
+        for _i in range(len(ani)):
+            ws_a.column_dimensions[get_column_letter(TBL_COL0 + 1 + _i)].width = 13
+
         indicator_letter = col_letter_map.get("Indicator", "")
 
         for group_name, col_name in COLUMN_MAP.items():
@@ -656,19 +670,19 @@ def _write_centralizator_file(df_final, _last_user):
                 continue
 
             # ── Titlu secțiune ────────────────────────────────────────────
-            tc = ws_a.cell(row=start_row - 1, column=2,
+            tc = ws_a.cell(row=start_row - 1, column=TBL_COL0,
                            value=f"Media Zilnică Lunară — {group_name}")
             tc.font = Font(name='Arial', size=12, bold=True, color=C_DARK)
 
             # ── Header: Luna | An... ──────────────────────────────────────
-            lh = ws_a.cell(row=start_row, column=2, value="Luna")
+            lh = ws_a.cell(row=start_row, column=TBL_COL0, value="Luna")
             lh.font = hfont();
             lh.fill = fill(C_MID)
             lh.border = brd;
             lh.alignment = ctr()
 
             for i, an in enumerate(ani):
-                hc = ws_a.cell(row=start_row, column=3 + i, value=an)
+                hc = ws_a.cell(row=start_row, column=TBL_COL0 + 1 + i, value=an)
                 hc.font = hfont();
                 hc.fill = fill(C_MID)
                 hc.border = brd;
@@ -678,7 +692,7 @@ def _write_centralizator_file(df_final, _last_user):
             for r_idx, luna in enumerate(luni_list):
                 row_num = start_row + 1 + r_idx
                 luna_nr = r_idx + 1
-                lc = ws_a.cell(row=row_num, column=2, value=luna)
+                lc = ws_a.cell(row=row_num, column=TBL_COL0, value=luna)
                 lc.font = dfont(bold=True)
                 lc.border = brd
                 lc.alignment = ctr()
@@ -686,7 +700,7 @@ def _write_centralizator_file(df_final, _last_user):
 
                 for c_idx, an in enumerate(ani):
                     an_cell_coord = ws_a.cell(row=start_row,
-                                              column=3 + c_idx).coordinate
+                                              column=TBL_COL0 + 1 + c_idx).coordinate
                     formula = (
                         f"=IFERROR(SUMIFS("
                         f"'Media Zilnica Lunara'!${col_letter}:${col_letter},"
@@ -695,7 +709,7 @@ def _write_centralizator_file(df_final, _last_user):
                         f"'Media Zilnica Lunara'!$C:$C,{luna_nr}"
                         f"),0)"
                     )
-                    fc = ws_a.cell(row=row_num, column=3 + c_idx, value=formula)
+                    fc = ws_a.cell(row=row_num, column=TBL_COL0 + 1 + c_idx, value=formula)
                     fc.font = dfont()
                     fc.border = brd
                     fc.alignment = rgt()
@@ -705,7 +719,7 @@ def _write_centralizator_file(df_final, _last_user):
             # ── Rândul MZA — sub Decembrie ────────────────────────────────
             mza_row = start_row + 13  # rândul 1=header, 2-13=luni, 14=MZA
 
-            lc_mza = ws_a.cell(row=mza_row, column=2, value="MZA")
+            lc_mza = ws_a.cell(row=mza_row, column=TBL_COL0, value="MZA")
             lc_mza.font = dfont(bold=True, color=C_WHITE)
             lc_mza.border = brd
             lc_mza.alignment = ctr()
@@ -713,11 +727,11 @@ def _write_centralizator_file(df_final, _last_user):
 
             for c_idx, an in enumerate(ani):
                 an_cell_coord = ws_a.cell(row=start_row,
-                                          column=3 + c_idx).coordinate
+                                          column=TBL_COL0 + 1 + c_idx).coordinate
                 # Coordonata celulei corespunzătoare lunii Mai (luna nr.5)
                 # pentru acest an și grup: rândul header + 5 (Mai = al 5-lea)
                 mai_row = start_row + MIN_LUNI_AN_MAI  # +5 → rândul Mai
-                mai_col = get_column_letter(3 + c_idx)
+                mai_col = get_column_letter(TBL_COL0 + 1 + c_idx)
                 mai_cell_coord = f"{mai_col}{mai_row}"
 
                 if indicator_letter:
@@ -775,7 +789,7 @@ def _write_centralizator_file(df_final, _last_user):
                         f"),\"\")"
                     )
 
-                fc_mza = ws_a.cell(row=mza_row, column=3 + c_idx,
+                fc_mza = ws_a.cell(row=mza_row, column=TBL_COL0 + 1 + c_idx,
                                    value=formula_mza)
                 fc_mza.font = dfont(bold=True, color=C_WHITE)
                 fc_mza.border = brd
@@ -783,15 +797,11 @@ def _write_centralizator_file(df_final, _last_user):
                 fc_mza.number_format = '#,##0'
                 fc_mza.fill = fill(C_DARK)
 
-            # ── Lățimi coloane ────────────────────────────────────────────
-            ws_a.column_dimensions["B"].width = 16
-            for i in range(len(ani)):
-                ws_a.column_dimensions[get_column_letter(3 + i)].width = 13
-
             # ── Grafic (numai lunile 1-12, MZA exclus) ───────────────────
-            data_ref = Reference(ws_a, min_col=3, max_col=2 + len(ani),
+            data_ref = Reference(ws_a, min_col=TBL_COL0 + 1,
+                                 max_col=TBL_COL0 + len(ani),
                                  min_row=start_row, max_row=start_row + 12)
-            cats_ref = Reference(ws_a, min_col=2,
+            cats_ref = Reference(ws_a, min_col=TBL_COL0,
                                  min_row=start_row + 1, max_row=start_row + 12)
 
             chart = LineChart()
@@ -824,7 +834,7 @@ def _write_centralizator_file(df_final, _last_user):
                 serie.marker.graphicalProperties.solidFill = culoare
                 serie.marker.graphicalProperties.line.solidFill = culoare
 
-            ws_a.add_chart(chart, f"H{start_row - 1}")
+            ws_a.add_chart(chart, f"A{start_row - 1}")
             start_row += 19  # 1 titlu + 1 header + 12 luni + 1 MZA + 4 spațiu
 
         # ── Ordinea sheet-urilor și sheet activ ──────────────────────────

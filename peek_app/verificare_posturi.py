@@ -27,6 +27,7 @@ raspuns - exact semnatura "CONTOR_CAZUT" descrisa mai sus.
 
 import os
 import re
+import sys
 import glob
 import socket
 import threading
@@ -34,7 +35,7 @@ import queue
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -65,6 +66,11 @@ PROTOCOL_RETRY_COUNT = 6      # de cate ori retrimitem WAKE+IDENTIFY daca nu vin
 PROTOCOL_RETRY_INTERVAL = 10.0  # secunde intre retrimiteri (buget total ~= COUNT*INTERVAL)
 
 MAX_WORKERS = 20            # cate posturi verificam in paralel
+
+# Verificarea zilnica: un post care nu e OK la primul tur este reverificat (doar el)
+# in inca INCERCARI_ZILNICE-1 ture, cu o pauza intre ture. Se opreste la primul OK.
+INCERCARI_ZILNICE = 3
+PAUZA_INTRE_TURE = 60.0     # secunde intre ture (pauza e comuna, nu blocheaza cate un thread)
 
 # Bytes reali, extrasi din capturile Portmon (snagov.LOG / nu_merge_contorul.LOG)
 WAKE_SEQUENCE = bytes.fromhex("00FF00FF00FF00FF00FF00FF00FF00FF00FF")  # 18 bytes
@@ -113,6 +119,7 @@ class RezultatPost:
     status: str          # "RETEA_CAZUTA" | "CONTOR_CAZUT" | "OK" | "EROARE"
     detaliu: str = ""
     verificat_la: str = ""   # ora exacta la care s-a terminat verificarea acestui post
+    incercari: int = 1       # cate ture a fost nevoie (1 = OK/esec din prima)
 
 
 def citeste_posturi() -> list[tuple[str, str, str, str, str, int]]:
@@ -198,8 +205,8 @@ def verifica_post(post_id: str, localitate: str, drdp: str, tip: str,
     return RezultatPost(post_id, localitate, drdp, tip, ip, port, status, detaliu, verificat_la)
 
 
-def verifica_toate_posturile(posturi: list[tuple[str, str, str, str, str, int]]) -> list[RezultatPost]:
-    """Verifica toate posturile in paralel folosind un pool simplu de threaduri."""
+def _tur_verificare(posturi: list[tuple[str, str, str, str, str, int]]) -> list[RezultatPost]:
+    """Un singur tur: verifica posturile date, in paralel, folosind un pool simplu de threaduri."""
     q: queue.Queue = queue.Queue()
     for p in posturi:
         q.put(p)
@@ -216,9 +223,13 @@ def verifica_toate_posturile(posturi: list[tuple[str, str, str, str, str, int]])
             rez = verifica_post(post_id, localitate, drdp, tip, ip, port)
             with lock:
                 rezultate.append(rez)
-                # afisare live in terminal, pe masura ce vin rezultatele
-                print(f"[{rez.status:13s}] {rez.post_id} - {rez.localitate} "
-                      f"(DRDP {rez.drdp}, {rez.tip})  ({rez.ip}:{rez.port})")
+                # afisare live in terminal, pe masura ce vin rezultatele. Un esec de
+                # afisare (ex. encoding la redirectare in fisier) NU trebuie sa opreasca threadul.
+                try:
+                    print(f"[{rez.status:13s}] {rez.post_id} - {rez.localitate} "
+                          f"(DRDP {rez.drdp}, {rez.tip})  ({rez.ip}:{rez.port})", flush=True)
+                except Exception:  # noqa: BLE001
+                    pass
             q.task_done()
 
     threads = [threading.Thread(target=worker) for _ in range(min(MAX_WORKERS, len(posturi)))]
@@ -228,6 +239,53 @@ def verifica_toate_posturile(posturi: list[tuple[str, str, str, str, str, int]])
         t.join()
 
     return rezultate
+
+
+def verifica_toate_posturile(posturi: list[tuple[str, str, str, str, str, int]],
+                             incercari: int = INCERCARI_ZILNICE,
+                             pauza: float = PAUZA_INTRE_TURE) -> list[RezultatPost]:
+    """Verifica posturile in pana la `incercari` ture. La fiecare tur se reiau doar
+    posturile care nu au fost OK; un post OK iese din joc. Rezultatul final al unui
+    post = cel din ultimul tur in care a fost verificat (OK daca a raspuns macar o data)."""
+    final: dict[str, RezultatPost] = {}
+    de_verificat = list(posturi)
+    for tur in range(1, max(1, incercari) + 1):
+        if not de_verificat:
+            break
+        if tur > 1:
+            print(f"--- Tur {tur}/{incercari}: reverific {len(de_verificat)} posturi "
+                  f"(dupa {pauza:.0f}s pauza) ---")
+            time.sleep(pauza)
+        for rez in _tur_verificare(de_verificat):
+            rez.incercari = tur
+            final[rez.post_id] = rez
+        de_verificat = [p for p in de_verificat
+                        if p[0] not in final or final[p[0]].status != "OK"]
+    # siguranta: orice post care n-a primit niciun rezultat e marcat EROARE, nu dispare
+    for post_id, localitate, drdp, tip, ip, port in posturi:
+        if post_id not in final:
+            final[post_id] = RezultatPost(post_id, localitate, drdp, tip, ip, port, "EROARE",
+                                          "verificarea nu a produs niciun rezultat",
+                                          datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                                          incercari)
+    return list(final.values())
+
+
+# ---------------------------------------------------------------------------
+# ISTORIC ZILNIC IN contoare.db (folosit de raport_mod_functionare.py)
+# ---------------------------------------------------------------------------
+
+def salveaza_verificari(rezultate: list[RezultatPost], data: date | None = None) -> int:
+    """Salveaza rezultatele verificarii pentru ziua `data` (implicit azi) in contoare.db.
+    Daca ziua a mai fost verificata, randurile aceluiasi post sunt inlocuite."""
+    data = data or date.today()
+    rows = [(r.post_id, r.status, r.detaliu, r.incercari, r.verificat_la) for r in rezultate]
+    return get_contoare_db().save_verificari(data.strftime("%Y-%m-%d"), rows)
+
+
+def citeste_verificari(data: date) -> dict[str, dict]:
+    """{post: {'status', 'detaliu', 'incercari', 'verificat_la'}} pentru ziua `data`."""
+    return get_contoare_db().get_verificari(data.strftime("%Y-%m-%d"))
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +540,14 @@ def genereaza_raport(rezultate: list[RezultatPost], cale_fisier: str) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Cand iesirea e redirectata in fisier (Task Scheduler / .bat), Windows foloseste
+    # cp1252, care nu poate scrie ă, ș, ț etc. Fortam UTF-8 (cu inlocuire la nevoie).
+    for _flux in (sys.stdout, sys.stderr):
+        try:
+            _flux.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     posturi = citeste_posturi()
     print(f"Verific {len(posturi)} posturi (ADR 3000 / ADR 2000 / ADR Sabre)...")
 
@@ -493,6 +559,20 @@ if __name__ == "__main__":
     n_eroare = sum(1 for r in rezultate if r.status == "EROARE")
 
     print(f"OK: {n_ok} | Contor cazut: {n_contor} | Retea cazuta: {n_retea} | Erori: {n_eroare}")
+
+    # Protectie: daca TOATE posturile par "retea cazuta", cel mai probabil calculatorul
+    # n-are acces la reteaua contoarelor (VPN neconectat etc.) - nu salvam rezultate false.
+    retea_indisponibila = (len(rezultate) >= 10 and n_ok == 0
+                           and n_retea >= 0.95 * len(rezultate))
+    if retea_indisponibila:
+        print("ATENTIE: aproape toate posturile apar ca 'Retea cazuta' - probabil lipsa acces "
+              "la retea/VPN de pe acest calculator. Rezultatele NU au fost salvate in istoric.")
+    else:
+        try:
+            n_salvate = salveaza_verificari(rezultate)
+            print(f"Istoric zilnic: {n_salvate} posturi salvate in contoare.db (verificare_zilnica)")
+        except Exception as e:  # noqa: BLE001 - raportul Excel se genereaza oricum
+            print(f"[WARN] Nu am putut salva istoricul zilnic in contoare.db: {e}")
 
     nume_fisier = datetime.now().strftime("raport_posturi_%d.%m.%Y_%H-%M-%S.xlsx")
     cale_completa = os.path.join(OUTPUT_FOLDER, nume_fisier)

@@ -27,6 +27,10 @@ import threading
 import webbrowser
 import time
 import os
+import re
+import socket
+import subprocess
+import tempfile
 import logging
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -39,6 +43,14 @@ log.setLevel(logging.ERROR)
 
 HARTA_PORT = 5757
 HARTA_URL  = f"http://127.0.0.1:{HARTA_PORT}"
+
+# ── Conectare Viper prin Remote Desktop ──────────────────────────────────────
+# Parola NU se salvează nicăieri: Windows o cere la fiecare conectare.
+VIPER_HOST      = "192.168.104.157"
+VIPER_USER      = "user"
+VIPER_RDP_PORT  = 3389
+_ORIGINI_OK     = {HARTA_URL, f"http://localhost:{HARTA_PORT}"}
+_CONTOR_RE      = re.compile(r"^[A-Za-z0-9_.\- ]{1,40}$")
 
 # ── Folder unde e harta_contoare.html ────────────────────────────────────────
 # În executabilul PyInstaller fișierele din datas sunt extrase în sys._MEIPASS
@@ -91,6 +103,67 @@ class HartaServer:
                 cdb.upsert(contor, info)
                 return jsonify({"ok": True, "contor": contor,
                                 "lat": lat, "lng": lng})
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+
+        @flask_app.route("/api/viper/conecteaza", methods=["POST"])
+        def api_viper():
+            """
+            Pornește Remote Desktop către VM-ul cu Viper și pune codul contorului
+            în clipboard (partajat în sesiunea RDP). Parola o cere Windows.
+            """
+            try:
+                # Doar din pagina hărții (blochează apeluri din alte site-uri)
+                if request.headers.get("Origin") not in _ORIGINI_OK:
+                    return jsonify({"error": "origine nepermisă"}), 403
+                if os.name != "nt":
+                    return jsonify({"error": "disponibil doar pe Windows"}), 400
+
+                data   = request.get_json(force=True) or {}
+                contor = str(data.get("contor", "")).strip()
+                if not _CONTOR_RE.match(contor):
+                    return jsonify({"error": "cod contor invalid"}), 400
+
+                # 1) VM-ul răspunde? (altfel VPN-ul e probabil oprit)
+                try:
+                    socket.create_connection(
+                        (VIPER_HOST, VIPER_RDP_PORT), timeout=3).close()
+                except OSError:
+                    return jsonify({
+                        "error": f"VM-ul Viper ({VIPER_HOST}) nu răspunde. "
+                                 f"Verifică conexiunea VPN."}), 503
+
+                # 2) Date contor (SiteID Viper = cod cu zerouri în față; IP din DB)
+                ip = ""
+                try:
+                    from database import get_contoare_db
+                    ip = (get_contoare_db().get(contor) or {}).get("IP", "") or ""
+                except Exception:
+                    pass
+                site_id = contor.zfill(12) if contor.isdigit() else contor
+
+                # 3) Clipboard (se transferă în sesiunea RDP)
+                try:
+                    subprocess.run(["clip"], input=site_id.encode("ascii", "ignore"),
+                                   creationflags=0x08000000, timeout=5)
+                except Exception:
+                    pass
+
+                # 4) Fișier .rdp (fără parolă; Windows o cere de fiecare dată)
+                rdp_path = os.path.join(tempfile.gettempdir(), "viper_cestrin.rdp")
+                with open(rdp_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        f"full address:s:{VIPER_HOST}:{VIPER_RDP_PORT}\n"
+                        f"username:s:{VIPER_USER}\n"
+                        "prompt for credentials:i:1\n"
+                        "redirectclipboard:i:1\n"
+                        "enablecredsspsupport:i:1\n"
+                        "authentication level:i:2\n"
+                    )
+                subprocess.Popen(["mstsc", rdp_path])
+
+                return jsonify({"ok": True, "contor": contor,
+                                "site_id": site_id, "ip": ip})
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 

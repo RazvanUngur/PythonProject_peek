@@ -277,6 +277,17 @@ CREATE INDEX IF NOT EXISTS idx_contoare_drum
     ON contoare (drum);
 CREATE INDEX IF NOT EXISTS idx_contoare_localitate
     ON contoare (localitate);
+
+-- Rezultatul verificarii zilnice a posturilor (verificare_posturi.py, Task Scheduler 08:00)
+CREATE TABLE IF NOT EXISTS verificare_zilnica (
+    data          TEXT    NOT NULL,          -- YYYY-MM-DD
+    post          TEXT    NOT NULL,
+    status        TEXT    NOT NULL,          -- OK | CONTOR_CAZUT | RETEA_CAZUTA | EROARE
+    detaliu       TEXT    DEFAULT '',
+    incercari     INTEGER DEFAULT 1,
+    verificat_la  TEXT    DEFAULT '',
+    PRIMARY KEY (data, post)
+);
 """
 
 
@@ -1033,6 +1044,46 @@ class ContoareDB:
             "FROM contoare WHERE COALESCE(activ, 1)=1 ORDER BY contor",
             self._conn()
         )
+
+    # ── Verificare zilnică posturi (verificare_posturi.py) ───────────────────
+    def save_verificari(self, data: str, rows: list) -> int:
+        """Salvează rezultatele verificării din ziua `data` ('YYYY-MM-DD').
+        rows = [(post, status, detaliu, incercari, verificat_la), ...]
+        Un post deja verificat în aceeași zi este înlocuit."""
+        import time
+        payload = [(data, str(r[0]), r[1], r[2] or "", int(r[3] or 1), r[4] or "")
+                   for r in rows]
+        last_err = None
+        for attempt in range(5):
+            try:
+                conn = self._conn()
+                with conn:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO verificare_zilnica "
+                        "(data, post, status, detaliu, incercari, verificat_la) "
+                        "VALUES (?,?,?,?,?,?)", payload)
+                return len(payload)
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" in str(e).lower():
+                    try:
+                        self._local.conn.close()
+                    except Exception:
+                        pass
+                    self._local.conn = None
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    raise
+        raise sqlite3.OperationalError(f"DB locked dupa 5 incercari: {last_err}")
+
+    def get_verificari(self, data: str) -> dict:
+        """{post: {'status','detaliu','incercari','verificat_la'}} pentru ziua `data` ('YYYY-MM-DD')."""
+        rows = self._conn().execute(
+            "SELECT post, status, detaliu, incercari, verificat_la "
+            "FROM verificare_zilnica WHERE data = ?", (data,)).fetchall()
+        return {r["post"]: {"status": r["status"], "detaliu": r["detaliu"] or "",
+                            "incercari": r["incercari"], "verificat_la": r["verificat_la"]}
+                for r in rows}
 
     def import_from_dict(self, db: dict) -> int:
         count = 0
